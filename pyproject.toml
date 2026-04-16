@@ -1,0 +1,33 @@
+[project]
+name = "cebra_trial"
+version = "0.1.0"
+description = "Trial-aware contrastive learning wrapper for CEBRA"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "cebra[datasets,dev,integrations]==0.6.0",
+    "plotly>=6.6.0",
+    "torch>=2.10.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.8",
+    "pre-commit>=3.5",
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
