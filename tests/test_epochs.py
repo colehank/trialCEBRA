@@ -5,7 +5,6 @@ import pytest
 
 from trial_cebra import TrialCEBRA, flatten_epochs
 
-
 # ---------------------------------------------------------------------------
 # flatten_epochs — shape contracts
 # ---------------------------------------------------------------------------
@@ -75,8 +74,8 @@ def test_flatten_label_per_timepoint_3d():
 def test_flatten_multiple_labels():
     ntrial, ntime, nneuro = 6, 20, 8
     X = np.random.randn(ntrial, ntime, nneuro).astype(np.float32)
-    y_cont = np.random.randn(ntrial, 10).astype(np.float32)   # per-trial
-    y_disc = np.zeros(ntrial, dtype=np.int64)                  # per-trial discrete
+    y_cont = np.random.randn(ntrial, 10).astype(np.float32)  # per-trial
+    y_disc = np.zeros(ntrial, dtype=np.int64)  # per-trial discrete
 
     _, y_flat, _, _ = flatten_epochs(X, y_cont, y_disc)
     assert len(y_flat) == 2
@@ -172,7 +171,13 @@ def test_transform_epochs_consistency():
 
 
 def test_fit_epochs_all_conditionals():
-    conditionals = ["trialTime", "trialDelta", "trial_delta", "trialTime_delta", "trialTime_trialDelta"]
+    conditionals = [
+        "trialTime",
+        "trialDelta",
+        "trial_delta",
+        "trialTime_delta",
+        "trialTime_trialDelta",
+    ]
     X, y = _make_epoch_data()
     for cond in conditionals:
         model = _small_model(conditional=cond)
