@@ -13,3 +13,4 @@ example/
 .*_cache/
 uv.toml
 .benchmarks/
+CEBRA/

@@ -1,10 +1,9 @@
 # TrialCEBRA
 [![PyPI](https://img.shields.io/pypi/v/TrialCEBRA?color=blue)](https://pypi.org/project/TrialCEBRA/)
 [![Tests](https://github.com/colehank/TrialCEBRA/actions/workflows/tests.yml/badge.svg)](https://github.com/colehank/TrialCEBRA/actions)  
+[English | [中文](README_zh.md)]
 
-*[中文](README_zh.md)*
-
-**Trial-aware contrastive learning for CEBRA** — a wrapper that adds five trial-structured sampling conditionals to [CEBRA](https://cebra.ai) without modifying its source code.
+**Trial-aware contrastive learning for CEBRA** — a wrapper that adds three trial-structured sampling conditionals to [CEBRA](https://cebra.ai) without modifying its source code.
 
 Designed for neuroscience experiments where neural recordings are organized as repeated trials (stimuli, conditions, epochs). Positive-pair selection is lifted from the *timepoint* level to the *trial* level: first select a target trial by stimulus similarity or at random, then draw a positive timepoint within that trial.
 
@@ -39,158 +38,138 @@ pip install TrialCEBRA
 import numpy as np
 from trial_cebra import TrialCEBRA
 
-# Neural data: (N_timepoints, neural_dim)
-X = np.random.randn(2000, 64).astype(np.float32)
+# Epoch-format neural data: (ntrial, ntime, nneuro)
+X = np.random.randn(40, 50, 64).astype(np.float32)
 
-# Continuous auxiliary variable (e.g. stimulus embedding): (N_timepoints, stim_dim)
-y_cont = np.random.randn(2000, 16).astype(np.float32)
-
-# Trial boundaries: 40 trials × 50 timepoints each
-trial_starts = np.arange(0,   2000, 50)
-trial_ends   = np.arange(50,  2001, 50)
+# Trial-level stimulus embedding: (ntrial, stim_dim)
+y = np.random.randn(40, 16).astype(np.float32)
 
 model = TrialCEBRA(
-    model_architecture = "offset10-model",
-    conditional        = "trial_delta",
-    time_offsets       = 5,
-    delta              = 0.3,
-    output_dimension   = 3,
-    max_iterations     = 1000,
-    batch_size         = 512,
+    model_architecture     = "offset10-model",
+    conditional            = "delta",   # trial-similarity sampling
+    time_offsets           = 5,
+    delta                  = 0.3,
+    sample_fix_trial       = False,
+    sample_exclude_intrial = True,
+    output_dimension       = 3,
+    max_iterations         = 1000,
+    batch_size             = 512,
 )
 
-model.fit(X, y_cont, trial_starts=trial_starts, trial_ends=trial_ends)
-embeddings = model.transform(X)   # (N_timepoints, 3)
+model.fit(X, y)                        # X: 3-D, trial boundaries inferred automatically
+embeddings = model.transform_epochs(X) # (ntrial, ntime, 3)
 ```
 
-### Epoch format (ntrial × ntime × nneuro)
+**Label shape contract by conditional:**
 
-If your data are already organized as epochs, pass the 3-D array directly — trial boundaries are inferred automatically:
-
-```python
-X_ep = np.random.randn(40, 50, 64).astype(np.float32)
-
-y_pertrial     = np.random.randn(40, 16).astype(np.float32)       # (ntrial, stim_dim)
-y_pertimepoint = np.random.randn(40, 50, 16).astype(np.float32)   # (ntrial, ntime, stim_dim)
-
-model.fit(X_ep, y_pertrial)          # auto-detects 3-D
-emb = model.transform_epochs(X_ep)   # (ntrial, ntime, output_dimension)
-```
-
-**Label broadcasting rules for 3-D input:**
-
-| Label shape | Interpretation | Output shape |
+| `conditional` | y shape | Interpretation |
 |---|---|---|
-| `(ntrial,)` | per-trial discrete | `(ntrial*ntime,)` |
-| `(ntrial, d)` where `d ≠ ntime` | per-trial continuous | `(ntrial*ntime, d)` |
-| `(ntrial, ntime)` | per-timepoint | `(ntrial*ntime,)` |
-| `(ntrial, ntime, d)` | per-timepoint | `(ntrial*ntime, d)` |
+| `"time"` | not required | random trial + ±`time_offsets` window |
+| `"delta"` | `(ntrial, nd)` or `(ntrial, ntime, nd)` | trial-level OR per-timepoint label (3-D enables class-conditional trial selection with `y_discrete`) |
+| `"time_delta"` | `(ntrial, ntime, nd)` | timepoint-level label |
 
 ---
 
 ## Conditionals
 
-Five trial-aware conditionals organized along three orthogonal axes:
+Three trial-aware conditionals mirroring CEBRA's originals, lifted to the trial level:
 
-| Axis | Options |
-|---|---|
-| **Trial selection** | Random (uniform) · Gaussian delta-style · Gaussian time_delta-style |
-| **Time constraint** | `Time` — ±`time_offset` relative position within target trial · Free — uniform within trial |
-| **Locking** | Locked — fixed mapping pre-computed at `__init__` · Re-sampled — independent per training step |
+| `conditional` | Trial selection | Within-trial | y required | `sample_fix_trial` | `sample_exclude_intrial` |
+|---|---|---|---|---|---|
+| `"time"` | Random (uniform) | ±`time_offsets` | No | ignored | ✓ |
+| `"delta"` | Gaussian similarity on y (class-conditional when `y_discrete` + 3-D `y`) | Uniform (free) | `(ntrial, nd)` or `(ntrial, ntime, nd)` | ✓ | ✓ |
+| `"time_delta"` | Joint argmin over cross-trial candidates | ±`time_offsets` | `(ntrial, ntime, nd)` | ✓ | ✓ |
 
-### Conditional reference
+`sample_fix_trial` (default `False`) controls whether the trial→trial mapping is pre-computed once at init (`True`) or re-sampled at every training step (`False`). Has no effect for `"time"`.
 
-| `conditional` | Trial selection | Time constraint | Locking | Gap strategy |
-|---|---|---|---|---|
-| `"trialTime"` | Random | ±`time_offset` | — | global ±`time_offset` (class-uniform with discrete) |
-| `"trialDelta"` | delta-style | Free | **Locked** | delta-style at timepoint level |
-| `"trial_delta"` | delta-style | Free | Re-sampled | delta-style at timepoint level |
-| `"trialTime_delta"` | delta-style | ±`time_offset` | Re-sampled | delta-style at timepoint level |
-| `"trialTime_trialDelta"` | time_delta-style | ±`time_offset` | **Locked** | time_delta-style at timepoint level |
+`sample_exclude_intrial` (default `True`) controls whether the anchor's own trial is excluded from positive sampling. When `False`, positives may be drawn from any trial including the anchor's own.
 
-Native CEBRA conditionals (`"time"`, `"delta"`, `"time_delta"`, etc.) pass through unchanged.
-
-### Naming convention
-
-| Pattern | Meaning |
-|---|---|
-| `trialDelta` | capital D, no underscore → **Locked**, delta-style Gaussian |
-| `trial_delta` | underscore + lowercase → **Re-sampled**, delta-style Gaussian |
-| `trialTime` | Random trial + time constraint |
-| `trialTime_delta` | Time constraint + Re-sampled delta-style |
-| `trialTime_trialDelta` | Time constraint + Locked delta-style (time_delta mechanism) |
+Native CEBRA conditionals pass through unchanged when flat 2-D data is provided.
 
 ---
 
 ## How Sampling Works
 
-### Trial selection: delta-style
+### `"time"` — random trial + time window
 
-Used by `trialDelta`, `trial_delta`, and `trialTime_delta`. Mirrors CEBRA's `DeltaNormalDistribution` at the trial level:
+Target trial is drawn uniformly at random (≠ own trial) using the Gumbel-max trick. A positive timepoint is then sampled within ±`time_offsets` of the anchor's relative position in the target trial.
 
-```
-query        = trial_mean[anchor_trial] + N(0, δ²I)
-target_trial = argmin_j  dist(query, trial_mean[j])
-```
+### `"delta"` — Gaussian similarity + uniform within trial
 
-Each trial is represented by the **mean** of its timepoints' auxiliary variable. `δ` controls the exploration radius — small `δ` picks the most similar trial, large `δ` explores broadly. Noise is re-drawn every step, so the same anchor may pair with different trials across iterations.
-
-### Trial selection: time_delta-style
-
-Used only by `trialTime_trialDelta`. Mirrors CEBRA's `TimedeltaDistribution` at the trial level:
+Mirrors CEBRA's `DeltaNormalDistribution` at the trial level:
 
 ```
-Δstim[k]     = continuous[k] - continuous[k − time_offset]   (pre-computed)
-query        = trial_mean[anchor_trial] + Δstim[random_k]
-target_trial = argmin_j  dist(query, trial_mean[j])
+query        = y[anchor_trial] + N(0, δ²I) / √d
+target_trial = argmin_j  dist(query, y[j]),  j ≠ anchor
 ```
 
-Uses empirical stimulus-velocity vectors as perturbations — data-driven rather than isotropic.
+`y` accepts either shape `(ntrial, nd)` (per-trial) or `(ntrial, ntime, nd)` (per-timepoint). `δ` controls the exploration radius. A positive timepoint is sampled **uniformly** from the selected trial.
 
-### Locked vs Re-sampled
+**Discrete-first class-conditional trial selection** (when `y_discrete` is supplied): following CEBRA's `ConditionalIndex` design, the trial-selection basis switches to the anchor's own class:
 
-| | Locked (`trialDelta`, `trialTime_trialDelta`) | Re-sampled (`trial_delta`, `trialTime_delta`) |
+* **Mode A** — `y_discrete` is per-trial (constant within each trial): candidates are restricted to trials that share the anchor's class.
+* **Mode B** — `y_discrete` is per-timepoint AND `y` is 3-D: `trial_emb_per_class[c][trial] = mean(y[trial, t] for t where class(trial, t) == c)`. The anchor uses its own class's basis.
+* **Mode C** — `y_discrete` is per-timepoint but `y` is only 2-D: a warning is emitted and trial selection falls back to class-agnostic `y`. To enable full class-conditional selection, pass 3-D `y`.
+
+In all modes a tiny Gumbel perturbation is added before `argmin` to break ties stochastically (e.g., when all trials share the same class-c embedding, as happens for pre-stim gray-screen labels).
+
+### `"time_delta"` — joint argmin over cross-trial candidates
+
+For each anchor at `(trial_i, rel_i)`, the candidate pool is every timepoint in every other trial that falls within ±`time_offsets` of `rel_i`:
+
+```
+candidates = {(trial_j, t) : trial_j ≠ trial_i,  |t − rel_i| ≤ time_offsets}
+query      = y[trial_i, rel_i] + N(0, δ²I) / √d
+positive   = argmin_{(trial_j, t) ∈ candidates}  dist(y[trial_j, t], query)
+```
+
+`y` (shape `(ntrial, ntime, nd)`) is used directly as a per-timepoint label — no aggregation. The positive sample simultaneously satisfies three constraints: **cross-trial**, **time-aligned** (within ±`time_offsets`), and **label-similar**.
+
+On static stimuli (y constant within a trial) the argmin degrades gracefully to delta-style trial selection followed by uniform time-window sampling — no special handling required.
+
+**`fix_trial=True`**: the target trial is locked at init using the same Gaussian-similarity query as `"delta"` (on trial-onset embeddings `y[:, 0, :]`). At each step the within-trial timepoint is the argmin of y-distance inside the ±`time_offsets` window of the locked trial.
+
+### `sample_fix_trial`
+
+| | `sample_fix_trial=False` (default) | `sample_fix_trial=True` |
 |---|---|---|
-| Target trial | Pre-computed once at `__init__`, fixed | Independently drawn every training step |
-| Gradient signal | Consistent — same trial pair repeated | Diverse — anchor sees different similar trials |
-| Generalization | May learn pair-specific features | Learns features valid across all similar trials |
-| Best for | Few trials, stable training | Many trials, rich stimulus content |
+| Target trial | Re-sampled independently every training step | Pre-computed once at `__init__`, fixed |
+| Gradient signal | Diverse — anchor sees different similar trials | Consistent — same trial pair repeated |
+| Best for | Many trials, rich stimulus content | Few trials, stable training |
 
 ---
 
 ## Visualizing Sampling Behavior
 
-The figures below are produced by `example/viz_trial_sampling.py` on real MEG data with ImageNet stimuli. Each panel shows **R** (reference anchor), **+** (positive samples), **−** (negative samples). Border color encodes in-trial time position (colorbar on the right; black = gap timepoints).
+The figures below are produced by `example/viz_trial_sampling.py` on real MEG data with ImageNet stimuli. Each panel shows **R** (reference anchor), **+** (positive samples), **−** (negative samples).
 
 ### Trial sampling: R / + / −
 
 ![Trial sampling](resources/fig_trial_sampling.png)
 
-- **`trialTime`** — positives from a uniformly random other trial, centered near the anchor's relative time. Stimulus grid is diverse with no similarity bias.
-- **`trialDelta`** — positives cluster on a single *locked* target trial (fixed by stimulus similarity at init). All positive frames show the same image, confirming the fixed mapping.
-- **`trial_delta`** — target trial is re-sampled every step. Positive frames spread across several similar stimuli while maintaining content coherence.
-- **`trialTime_delta`** — same trial diversity as `trial_delta`, but additionally constrained to ±`time_offset` of the anchor's relative position.
-- **`trialTime_trialDelta`** — locked target trial + time window. Positives concentrate on a single stimulus image at a specific post-stimulus latency.
+- **`time`** — positives from a uniformly random other trial, centered near the anchor's relative time position.
+- **`delta`** — positives from a trial selected by Gaussian similarity on trial embeddings (`fix_trial=False`: target trial varies each step). When `y_discrete` is provided, the selection becomes class-conditional (discrete-first principle).
+- **`time_delta`** — same velocity-based trial selection, additionally constrained to ±`time_offsets` of the anchor's relative position.
 
 ### Sampling timeline
 
 ![Sampling timeline](resources/fig_sampling.png)
 
-Each sampled frame is placed on a timeline spanning the full trial duration. The green band marks the ±`time_offset` window around the anchor's relative position.
+Each sampled frame is placed on a timeline spanning the full trial duration. The green band marks the ±`time_offsets` window around the anchor's relative position.
 
 ---
 
 ## Learned Embeddings
 
-All eight conditionals (3 native CEBRA + 5 trial-aware) trained on the same MEG dataset for 10 000 iterations. Points colored by **in-trial time** (black = pre-stimulus / gap; yellow-green = late post-stimulus).
+All six conditionals (3 native CEBRA + 3 trial-aware) trained on the same MEG dataset. Points colored by **in-trial time**.
 
 ### 3D embeddings colored by time
 
 ![3D embeddings](resources/fig_3d_embeddings.png)
 
-**Native CEBRA (top row):** `time` — uniform sphere, no temporal structure. `time_delta` — similar but with weak temporal gradients. `delta` — stimulus content dominates; gap frames collapse to a single dark patch.
+**Native CEBRA (top row):** `time` — uniform sphere, no temporal structure. `delta` — stimulus content dominates; flat within-trial structure. `time_delta` — weak temporal gradients.
 
-**Trial-aware TrialCEBRA (bottom row):** `trialTime_delta` — clearest temporal ring with gap frames separated into a distinct cluster. `trialTime` — similar ring, smoother gradient. `trialDelta` — clean gap separation, more scattered trial frames. `trial_delta` — more uniform embedding of trial frames. `trialTime_trialDelta` — tightest per-latency clustering.
+**Trial-aware TrialCEBRA (bottom row):** `time` — temporal ring from cross-trial alignment. `delta` — clean trial clustering by stimulus similarity. `time_delta` — sharpest per-latency structure.
 
 ### Training loss
 
@@ -200,49 +179,61 @@ All conditionals converge smoothly. Trial-aware conditionals start at higher los
 
 ---
 
-## Gap (Inter-trial) Timepoints
+## Label Broadcasting (Epoch Format)
 
-Timepoints between trials are **valid anchors**. Each conditional defines a fallback strategy:
+When `X` is 3-D `(ntrial, ntime, nneuro)`, labels are broadcast to flat format automatically:
 
-| `conditional` | Gap strategy |
-|---|---|
-| `trialTime` | Global ±`time_offset` window; with discrete labels → global class-uniform (Gumbel-max) |
-| `trialDelta` | delta-style at timepoint level |
-| `trial_delta` | delta-style at timepoint level |
-| `trialTime_delta` | delta-style at timepoint level |
-| `trialTime_trialDelta` | time_delta-style at timepoint level |
-
-> **Tip:** Pass a discrete label array marking trial vs. gap (e.g. `0 = gap`, `1 = trial`). With discrete labels, `trialTime`'s gap fallback switches to **global class-uniform sampling** (Gumbel-max trick), forcing gap timepoints to cluster together in embedding space.
+| Label shape | Interpretation | Flat output shape |
+|---|---|---|
+| `(ntrial,)` | per-trial discrete | `(ntrial*ntime,)` |
+| `(ntrial, d)` where `d ≠ ntime` | per-trial continuous | `(ntrial*ntime, d)` |
+| `(ntrial, ntime)` | per-timepoint | `(ntrial*ntime,)` |
+| `(ntrial, ntime, d)` | per-timepoint | `(ntrial*ntime, d)` |
 
 ---
 
-## Discrete Label Support
+## Multi-session training
 
-All conditionals accept an optional discrete label array. When provided:
-
-- `sample_prior` uses **class-balanced sampling** (matching CEBRA's `MixedDataLoader`).
-- Trial selection is restricted to **same-class trials**.
-- Gap anchor sampling switches to **global class-uniform** (Gumbel-max trick).
+TrialCEBRA supports CEBRA's multi-session paradigm on top of trial-aware sampling. Pass `X` as a **list** of epoch-format arrays (one per session) and auxiliary labels as parallel lists:
 
 ```python
-# Discrete: 0 = gap, 1 = trial
-y_disc = np.zeros(N, dtype=np.int64)
-for s, e in zip(trial_starts, trial_ends):
-    y_disc[s:e] = 1
+# 2 sessions, potentially different (ntrial, ntime, nneuro) per session
+X = [
+    np.random.randn(30, 100, 64).astype(np.float32),   # session 0
+    np.random.randn(25,  80, 48).astype(np.float32),   # session 1 (different shape OK)
+]
+y_cont = [np.random.randn(30, 100, 16).astype(np.float32),
+          np.random.randn(25,  80, 16).astype(np.float32)]
+y_disc = [np.zeros((30, 100), dtype=np.int64), np.zeros((25, 80), dtype=np.int64)]
+# ... populate pre/post classes in y_disc ...
 
-model.fit(X, y_cont, y_disc, trial_starts=trial_starts, trial_ends=trial_ends)
+model = TrialCEBRA(conditional="delta", max_iterations=1000, output_dimension=3, ...)
+model.fit(X, y_disc, y_cont)   # auto-detects multisession from list-of-arrays
 ```
 
-**Discrete-only (no continuous labels)** is supported for `"trialTime"`:
+### CEBRA philosophy, preserved
 
-```python
-y_disc = np.zeros(ntrial, dtype=np.int64)
-y_disc[ntrial // 2:] = 1
+Alignment comes from the **cross-session query shuffle** (see `cebra.distributions.multisession.MultisessionSampler`): each session computes its own query in y-space, queries are redistributed across sessions so every positive is found in a **different** session than its anchor, encoders are forced to map semantically equivalent states to nearby points. `mix` / `index_reversed` re-align ref ↔ pos for the contrastive loss.
 
-model.fit(X_ep, y_disc)   # X_ep: (ntrial, ntime, nneuro)
-```
+### What's supported
 
-> Delta-style conditionals (`trialDelta`, `trial_delta`, `trialTime_delta`, `trialTime_trialDelta`) require continuous labels for trial similarity matching and will raise `ValueError` if none are provided.
+| Conditional | Multisession | Behavior |
+|---|---|---|
+| `"delta"` | ✓ full support | Mode A / Mode B class-conditional trial selection per session; cross-session shuffle; same-class constraint enforced across sessions |
+| `"time_delta"` | ✓ | joint argmin in y-space; **±`time_offsets` window is dropped** (relative time positions don't transfer across sessions with heterogeneous `ntime`) |
+| `"time"` | ✗ `NotImplementedError` | matches CEBRA native — `_init_loader` rejects multisession without a behavioural index |
+
+### Constraints (validated at init)
+
+- **≥ 2 sessions**; heterogeneous `(ntrial_s, ntime_s, nneuro_s)` allowed
+- All sessions share the same continuous y feature dim (`nd`)
+- If `y_discrete` is provided, all sessions must share the **same sorted unique class set**
+- **Mode C** (per-timepoint discrete + 2-D y_continuous) is **not allowed** in multisession — pass 3-D y_continuous for every session
+- Strict cross-session: every positive comes from a session different from its anchor's (per-batch-position derangement of queries)
+
+### `sample_exclude_intrial` in multisession
+
+At the sampler layer, cross-session is strict, so per-session `sample_exclude_intrial` is effectively superseded. Internally each per-session `TrialAwareDistribution` is built with `sample_exclude_intrial=False` to avoid redundant masking.
 
 ---
 
@@ -254,17 +245,17 @@ Inherits all parameters from `cebra.CEBRA`. Key additions:
 
 ```python
 TrialCEBRA(
-    conditional: str,      # trial-aware or native CEBRA conditional
-    time_offsets: int,     # half-width of time window; also used for Δstim lag
-    delta: float,          # Gaussian kernel std for trial selection
+    conditional: str,                    # "time", "delta", "time_delta", or any native CEBRA conditional
+    time_offsets: int,                   # half-width of the within-trial time window
+    delta: float,                        # Gaussian noise std for trial similarity matching
+    sample_fix_trial: bool = False,      # pre-compute trial→trial mapping at init
+    sample_exclude_intrial: bool = True, # exclude anchor's own trial from positive sampling
     **cebra_kwargs,
 )
 
-# Flat format
-model.fit(X, *y, trial_starts, trial_ends, adapt=False, callback=None, callback_frequency=None)
-
 # Epoch format — trial boundaries inferred automatically
 model.fit(X, *y)           # X: (ntrial, ntime, nneuro)
+model.fit_epochs(X, *y)    # convenience alias
 
 model.transform(X)         # → np.ndarray (N, output_dimension)
 model.transform_epochs(X)  # → np.ndarray (ntrial, ntime, output_dimension)
@@ -280,18 +271,31 @@ from trial_cebra import TrialAwareDistribution
 import torch
 
 dist = TrialAwareDistribution(
-    continuous   = torch.randn(500, 16),
-    trial_starts = torch.tensor([0, 100, 200, 300, 400]),
-    trial_ends   = torch.tensor([100, 200, 300, 400, 500]),
-    conditional  = "trial_delta",
-    time_offset  = 10,
-    delta        = 0.3,
-    device       = "cpu",
-    seed         = 42,
-    discrete     = None,   # optional (N,) int tensor
+    ntrial                 = 40,
+    ntime                  = 50,
+    conditional            = "delta",
+    y                      = torch.randn(40, 16),   # (ntrial, nd)
+    sample_fix_trial       = False,
+    sample_exclude_intrial = True,
+    time_offsets           = 10,
+    delta                  = 0.3,
+    device                 = "cpu",
+    seed                   = 42,
 )
 
-ref, pos = dist.sample_joint(num_samples=64)
+ref = dist.sample_prior(num_samples=64)
+pos = dist.sample_conditional(ref)
+```
+
+### `flatten_epochs`
+
+Converts epoch-format arrays to flat format with trial metadata.
+
+```python
+from trial_cebra import flatten_epochs
+
+X_flat, y_flat, trial_starts, trial_ends = flatten_epochs(X_ep, y_ep)
+# X_ep: (ntrial, ntime, nneuro) → X_flat: (ntrial*ntime, nneuro)
 ```
 
 ### `TrialTensorDataset`
@@ -304,7 +308,6 @@ from trial_cebra import TrialTensorDataset
 dataset = TrialTensorDataset(
     neural       = neural_tensor,
     continuous   = stim_tensor,
-    discrete     = label_tensor,   # optional
     trial_starts = starts_tensor,
     trial_ends   = ends_tensor,
     device       = "cpu",
@@ -317,7 +320,7 @@ dataset = TrialTensorDataset(
 
 **Post-replace distribution** — `TrialCEBRA` does not modify CEBRA's source. Instead it temporarily sets `conditional = "time_delta"` to pass CEBRA's internal validation, calls `super()._prepare_loader(...)` to obtain a standard loader, then replaces `loader.distribution` with a `TrialAwareDistribution` in-place. Both loader types call only `distribution.sample_prior` and `distribution.sample_conditional` inside `get_indices`, so the replacement is fully transparent to the training loop.
 
-**Mixed-label routing** — When both discrete and continuous labels are provided, CEBRA always creates a `MixedDataLoader` regardless of `conditional`. `TrialCEBRA` inherits this routing and replaces the distribution afterwards; the `conditional` parameter only affects the `TrialAwareDistribution`.
+The conditional name overlap (`"time"` and `"time_delta"` are both CEBRA native and TrialCEBRA names) is resolved by checking for trial metadata on the dataset: TrialCEBRA only activates the trial-aware path when `trial_starts`/`trial_ends` are present on the dataset, ensuring native CEBRA behavior is preserved for flat 2-D inputs.
 
 ---
 
@@ -328,7 +331,7 @@ src/trial_cebra/
   __init__.py       public API: TrialCEBRA, TrialTensorDataset, TrialAwareDistribution, flatten_epochs
   cebra.py          TrialCEBRA sklearn estimator
   dataset.py        TrialTensorDataset (PyTorch dataset)
-  distribution.py   TrialAwareDistribution (all five conditionals)
+  distribution.py   TrialAwareDistribution (three trial-aware conditionals)
   epochs.py         flatten_epochs utility
 
 tests/

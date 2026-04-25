@@ -23,9 +23,21 @@ from importlib.metadata import PackageNotFoundError, version
 from trial_cebra.cebra import TrialCEBRA
 from trial_cebra.dataset import TrialTensorDataset
 from trial_cebra.distribution import TrialAwareDistribution
-from trial_cebra.epochs import flatten_epochs
+from trial_cebra.epochs import flatten_epochs, flatten_epochs_multisession
+from trial_cebra.multisession import (
+    TrialAwareMultisessionLoader,
+    TrialAwareMultisessionSampler,
+)
 
-__all__ = ["TrialCEBRA", "TrialTensorDataset", "TrialAwareDistribution", "flatten_epochs"]
+__all__ = [
+    "TrialCEBRA",
+    "TrialTensorDataset",
+    "TrialAwareDistribution",
+    "TrialAwareMultisessionSampler",
+    "TrialAwareMultisessionLoader",
+    "flatten_epochs",
+    "flatten_epochs_multisession",
+]
 
 try:
     __version__ = version("TrialCEBRA")

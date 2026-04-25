@@ -120,7 +120,7 @@ def _make_epoch_data(ntrial=12, ntime=50, nneuro=16, stim_dim=8):
     return X, y_cont
 
 
-def _small_model(conditional="trial_delta"):
+def _small_model(conditional="delta"):
     return TrialCEBRA(
         model_architecture="offset1-model",
         conditional=conditional,
@@ -171,18 +171,21 @@ def test_transform_epochs_consistency():
 
 
 def test_fit_epochs_all_conditionals():
-    conditionals = [
-        "trialTime",
-        "trialDelta",
-        "trial_delta",
-        "trialTime_delta",
-        "trialTime_trialDelta",
+    ntrial, ntime, nneuro, nd = 12, 50, 16, 8
+    X_ep = RNG.standard_normal((ntrial, ntime, nneuro)).astype(np.float32)
+    y2d = RNG.standard_normal((ntrial, nd)).astype(np.float32)
+    y3d = RNG.standard_normal((ntrial, ntime, nd)).astype(np.float32)
+
+    cases = [
+        ("time", None),
+        ("delta", y2d),
+        ("time_delta", y3d),
     ]
-    X, y = _make_epoch_data()
-    for cond in conditionals:
+    for cond, y in cases:
         model = _small_model(conditional=cond)
-        model.fit_epochs(X, y)
-        emb = model.transform_epochs(X)
+        args = (X_ep, y) if y is not None else (X_ep,)
+        model.fit_epochs(*args)
+        emb = model.transform_epochs(X_ep)
         assert emb.ndim == 3, f"conditional={cond!r} returned {emb.ndim}-D array"
 
 

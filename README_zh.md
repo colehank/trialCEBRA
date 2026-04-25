@@ -1,10 +1,11 @@
 # TrialCEBRA
-*[English](README.md)*
+
 
 [![PyPI](https://img.shields.io/pypi/v/TrialCEBRA?color=blue)](https://pypi.org/project/TrialCEBRA/)
-[![Tests](https://github.com/colehank/TrialCEBRA/actions/workflows/tests.yml/badge.svg)](https://github.com/colehank/TrialCEBRA/actions)
+[![Tests](https://github.com/colehank/TrialCEBRA/actions/workflows/tests.yml/badge.svg)](https://github.com/colehank/TrialCEBRA/actions)  
+[English](README.md) | 中文  
 
-**为 CEBRA 提供 trial 感知对比学习** —— 在不修改 CEBRA 源代码的前提下，为其添加五种面向试次结构的采样模式。
+**为 CEBRA 提供 trial 感知对比学习** —— 在不修改 CEBRA 源代码的前提下，为其添加三种面向试次结构的采样模式。
 
 适用于神经科学实验中以重复试次（trial）为单位组织的神经记录数据。核心思想：将正样本对的选取从"时间点级"提升到"试次级"——先按刺激相似度或均匀随机选择目标 trial，再在目标 trial 内采样正样本时间点。
 
@@ -40,158 +41,138 @@ pip install TrialCEBRA
 import numpy as np
 from trial_cebra import TrialCEBRA
 
-# 神经数据: (N_timepoints, neural_dim)
-X = np.random.randn(2000, 64).astype(np.float32)
+# Epoch 格式神经数据：(ntrial, ntime, nneuro)
+X = np.random.randn(40, 50, 64).astype(np.float32)
 
-# 连续辅助变量（如刺激嵌入）: (N_timepoints, stim_dim)
-y_cont = np.random.randn(2000, 16).astype(np.float32)
-
-# Trial 边界：40 个 trial，每个 50 帧
-trial_starts = np.arange(0,   2000, 50)
-trial_ends   = np.arange(50,  2001, 50)
+# Trial 级刺激嵌入：(ntrial, stim_dim)
+y = np.random.randn(40, 16).astype(np.float32)
 
 model = TrialCEBRA(
-    model_architecture = "offset10-model",
-    conditional        = "trial_delta",
-    time_offsets       = 5,
-    delta              = 0.3,
-    output_dimension   = 3,
-    max_iterations     = 1000,
-    batch_size         = 512,
+    model_architecture     = "offset10-model",
+    conditional            = "delta",   # 基于 trial 相似度的采样
+    time_offsets           = 5,
+    delta                  = 0.3,
+    sample_fix_trial       = False,
+    sample_exclude_intrial = True,
+    output_dimension       = 3,
+    max_iterations         = 1000,
+    batch_size             = 512,
 )
 
-model.fit(X, y_cont, trial_starts=trial_starts, trial_ends=trial_ends)
-embeddings = model.transform(X)   # (N_timepoints, 3)
+model.fit(X, y)                        # X 为 3D，自动推断 trial 边界
+embeddings = model.transform_epochs(X) # (ntrial, ntime, 3)
 ```
 
-### Epoch 格式（ntrial × ntime × nneuro）
+**各 conditional 对应的标签形状：**
 
-若数据已按 trial 组织为三维数组，可直接传入——trial 边界自动推导：
-
-```python
-X_ep = np.random.randn(40, 50, 64).astype(np.float32)
-
-y_pertrial     = np.random.randn(40, 16).astype(np.float32)        # (ntrial, stim_dim)
-y_pertimepoint = np.random.randn(40, 50, 16).astype(np.float32)    # (ntrial, ntime, stim_dim)
-
-model.fit(X_ep, y_pertrial)          # 自动识别 3D
-emb = model.transform_epochs(X_ep)   # (ntrial, ntime, output_dimension)
-```
-
-**3D 输入时标签广播规则：**
-
-| 标签形状 | 解释 | 输出形状 |
+| `conditional` | y 形状 | 含义 |
 |---|---|---|
-| `(ntrial,)` | per-trial 离散 | `(ntrial*ntime,)` |
-| `(ntrial, d)`，`d ≠ ntime` | per-trial 连续 | `(ntrial*ntime, d)` |
-| `(ntrial, ntime)` | per-timepoint | `(ntrial*ntime,)` |
-| `(ntrial, ntime, d)` | per-timepoint | `(ntrial*ntime, d)` |
+| `"time"` | 不需要 | 随机 trial + ±`time_offsets` 时间窗 |
+| `"delta"` | `(ntrial, nd)` 或 `(ntrial, ntime, nd)` | trial 级 或 逐时间点标签（3-D 形式配合 `y_discrete` 可启用类条件 trial 选择）|
+| `"time_delta"` | `(ntrial, ntime, nd)` | 时间点级标签 |
 
 ---
 
 ## Conditional 体系
 
-五种 trial-aware conditional，沿三个正交轴设计：
+三种 trial-aware conditional，与 CEBRA 原生 conditional 命名对齐，提升至 trial 层级：
 
-| 轴 | 选项 |
-|---|---|
-| **Trial 选择方式** | Random（均匀随机）· Gaussian delta-style · Gaussian time_delta-style |
-| **时间约束** | `Time` — 目标 trial 内 ±`time_offset` 相对位置 · Free — trial 内均匀，无约束 |
-| **锁定方式** | Locked — init 时预计算，全程固定 · Re-sampled — 每训练步独立重采样 |
+| `conditional` | Trial 选择 | Trial 内采样 | y 要求 | `sample_fix_trial` | `sample_exclude_intrial` |
+|---|---|---|---|---|---|
+| `"time"` | 均匀随机 | ±`time_offsets` 时间窗 | 不需要 | 无效 | ✓ |
+| `"delta"` | 基于 y 的 Gaussian 相似度（提供 `y_discrete` + 3-D `y` 时按类条件进行）| 均匀（自由） | `(ntrial, nd)` 或 `(ntrial, ntime, nd)` | ✓ | ✓ |
+| `"time_delta"` | 跨 trial 候选的联合 argmin | ±`time_offsets` 时间窗 | `(ntrial, ntime, nd)` | ✓ | ✓ |
 
-### Conditional 对比表
+`sample_fix_trial`（默认 `False`）控制 trial→trial 映射的计算方式：`True` 在 init 时预计算并固定，`False` 则每训练步独立重采样。对 `"time"` 无效。
 
-| `conditional` | Trial 选择 | 时间约束 | 锁定 | Gap 策略 |
-|---|---|---|---|---|
-| `"trialTime"` | Random | ±`time_offset` | — | 全局 ±`time_offset`（有离散标签时全类均匀） |
-| `"trialDelta"` | delta-style | Free | **Locked** | 时间点级 delta-style |
-| `"trial_delta"` | delta-style | Free | Re-sampled | 时间点级 delta-style |
-| `"trialTime_delta"` | delta-style | ±`time_offset` | Re-sampled | 时间点级 delta-style |
-| `"trialTime_trialDelta"` | time_delta-style | ±`time_offset` | **Locked** | 时间点级 time_delta-style |
+`sample_exclude_intrial`（默认 `True`）控制是否将 anchor 所在 trial 排除在正样本采样之外。`False` 时正例可来自任意 trial（含自身）。
 
-原生 CEBRA conditional（`"time"`、`"delta"`、`"time_delta"` 等）直接透传，不受影响。
-
-### 命名规律
-
-| 模式 | 含义 |
-|---|---|
-| `trialDelta` | 大写 D，无下划线 → **Locked** + delta-style Gaussian |
-| `trial_delta` | 下划线 + 小写 d → **Re-sampled** + delta-style Gaussian |
-| `trialTime` | Random trial + 时间约束 |
-| `trialTime_delta` | 时间约束 + Re-sampled delta-style |
-| `trialTime_trialDelta` | 时间约束 + Locked delta-style（time_delta 机制） |
+传入扁平 2D 数据时，原生 CEBRA conditional 直接透传，行为不变。
 
 ---
 
 ## 采样机制详解
 
-### Trial 选择：delta-style
+### `"time"` —— 随机 trial + 时间窗
 
-用于 `trialDelta`、`trial_delta`、`trialTime_delta`，将 CEBRA 的 `DeltaNormalDistribution` 提升至 trial 层级：
+用 Gumbel-max trick 均匀随机选取目标 trial（≠ 自身），再在目标 trial 内 ±`time_offsets` 范围内采样正样本时间点。
 
-```
-query        = trial_mean[anchor_trial] + N(0, δ²I)
-target_trial = argmin_j  dist(query, trial_mean[j])
-```
+### `"delta"` —— Gaussian 相似度 + trial 内均匀
 
-每个 trial 以其时间点连续辅助变量的**均值**作为代表向量。`δ` 控制探索半径：小 `δ` 选取最相似 trial，大 `δ` 广泛探索。噪声每步重新采样，同一 anchor 在不同训练步可与不同 trial 配对。
-
-### Trial 选择：time_delta-style
-
-仅用于 `trialTime_trialDelta`，将 CEBRA 的 `TimedeltaDistribution` 提升至 trial 层级：
+将 CEBRA 的 `DeltaNormalDistribution` 提升至 trial 层级：
 
 ```
-Δstim[k]     = continuous[k] - continuous[k − time_offset]   （预计算）
-query        = trial_mean[anchor_trial] + Δstim[random_k]
-target_trial = argmin_j  dist(query, trial_mean[j])
+query        = y[anchor_trial] + N(0, δ²I) / √d
+target_trial = argmin_j  dist(query, y[j]),  j ≠ anchor
 ```
 
-使用实测刺激速度向量作为扰动，数据驱动而非各向同性。
+`y` 接受 `(ntrial, nd)`（per-trial）或 `(ntrial, ntime, nd)`（per-timepoint）两种形状。`δ` 控制探索半径。正样本在选定 trial 内**均匀**采样。
 
-### Locked vs Re-sampled
+**Discrete-first 类条件 trial 选择**（提供 `y_discrete` 时）：对齐 CEBRA 官方 `ConditionalIndex` 设计，trial 选择基底改为按 anchor 自身 class 切换：
 
-| | Locked（`trialDelta`、`trialTime_trialDelta`） | Re-sampled（`trial_delta`、`trialTime_delta`） |
+* **Mode A** —— `y_discrete` 是 per-trial（trial 内不变）：候选限于与 anchor 同 class 的 trial。
+* **Mode B** —— `y_discrete` 是 per-timepoint **且** `y` 是 3-D：`trial_emb_per_class[c][trial] = mean(y[trial, t] for t where class(trial,t) == c)`，anchor 用自己 class 对应的基底查询。
+* **Mode C** —— `y_discrete` 是 per-timepoint 但 `y` 仅为 2-D：init 时发出 warning，trial 选择降级为 class-agnostic（同类约束仍在 timepoint 阶段执行）。要启用完整 class-conditional，请改传 3-D `y`。
+
+所有模式都会在 `argmin` 之前给 `dists` 加极小 Gumbel 扰动以随机化打破并列（例如所有 trial 的 class-c 嵌入相同时——pre-stim 灰屏标签的典型情况）。
+
+### `"time_delta"` —— 跨 trial 候选联合 argmin
+
+对于位于 `(trial_i, rel_i)` 的 anchor，候选池为所有其他 trial 中相对位置落在 ±`time_offsets` 范围内的时间点：
+
+```
+候选池  = {(trial_j, t) : trial_j ≠ trial_i，|t − rel_i| ≤ time_offsets}
+query   = y[trial_i, rel_i] + N(0, δ²I) / √d
+正样本  = argmin_{(trial_j, t) ∈ 候选池}  dist(y[trial_j, t], query)
+```
+
+`y`（形状 `(ntrial, ntime, nd)`）直接用作逐时间点标签，无聚合。正样本同时满足三个约束：**跨 trial**、**时间对齐**（±`time_offsets` 内）、**label 相似**。
+
+对于静态刺激（trial 内 y 恒定），argmin 自然退化为 delta 式 trial 选择 + 时间窗均匀采样，无需特殊处理。
+
+**`fix_trial=True`**：目标 trial 在 init 时锁定，使用与 `"delta"` 相同的 Gaussian 相似度查询（基于 trial onset 嵌入 `y[:, 0, :]`）。每步在锁定 trial 的 ±`time_offsets` 窗口内取 y 距离最小的时间点。
+
+### `sample_fix_trial`
+
+| | `sample_fix_trial=False`（默认） | `sample_fix_trial=True` |
 |---|---|---|
-| 目标 trial | init 预计算，全程固定 | 每训练步独立重采样 |
-| 梯度信号 | 一致：同一 trial 对反复比较 | 多样：anchor 每步见到不同相似 trial |
-| 泛化性 | 较弱（可能学到 trial 对特有特征） | 较强（学到对所有相似 trial 成立的特征） |
-| 适用场景 | 试次较少、需要稳定训练 | 试次较多、刺激内容丰富 |
+| 目标 trial | 每训练步独立重采样 | init 时预计算，全程固定 |
+| 梯度信号 | 多样：anchor 每步见到不同相似 trial | 一致：同一 trial 对反复比较 |
+| 适用场景 | 试次较多、刺激内容丰富 | 试次较少、需要稳定训练 |
 
 ---
 
 ## 采样行为可视化
 
-以下图片在真实 MEG + ImageNet 刺激数据上生成。每个面板展示 **R**（参考锚点）、**+**（正样本）、**−**（负样本）；边框颜色表示该帧在 trial 内的时间位置（黑色边框 = gap 时间点）。
+以下图片在真实 MEG + ImageNet 刺激数据上生成。每个面板展示 **R**（参考锚点）、**+**（正样本）、**−**（负样本）。
 
 ### Trial 采样：R / + / −
 
 ![Trial 采样可视化](resources/fig_trial_sampling.png)
 
-- **`trialTime`** — 正样本来自均匀随机的目标 trial，时间位置对齐到 anchor 的相对位置附近，图像网格多样。
-- **`trialDelta`** — 正样本集中在 init 时锁定的**单个**目标 trial，所有正样本图像相同。
-- **`trial_delta`** — 目标 trial 每步重采样，正样本跨越多个相似刺激，多样性高于 `trialDelta`。
-- **`trialTime_delta`** — trial 选取多样性同 `trial_delta`，额外叠加 ±`time_offset` 时间窗约束。
-- **`trialTime_trialDelta`** — 固定目标 trial + 时间窗，正样本集中在特定刺激与特定 post-stimulus 潜伏期。
+- **`time`** — 正样本来自均匀随机的目标 trial，时间位置对齐到 anchor 的相对位置附近。
+- **`delta`** — 正样本来自基于 trial 嵌入 Gaussian 相似度选定的 trial（`fix_trial=False` 时每步变化）。提供 `y_discrete` 时选择按类条件进行（discrete-first 原则）。
+- **`time_delta`** — 同样基于速度相似度选 trial，额外叠加 ±`time_offsets` 时间窗约束。
 
 ### 采样时间线
 
 ![采样时间线](resources/fig_sampling.png)
 
-每个采样帧按 trial 内绝对时间标注于时间轴。绿色高亮区域为 ±`time_offset` 时间窗，带 `Time` 约束的 conditional 正样本均落在窗内。
+每个采样帧按 trial 内绝对时间标注于时间轴。绿色高亮区域为 ±`time_offsets` 时间窗。
 
 ---
 
 ## 学习到的嵌入
 
-8 种 conditional（3 种原生 + 5 种 trial-aware）在相同 MEG 数据集上各训练 10 000 步。点颜色按 **trial 内时间**编码（黑色 = 刺激前 / gap；黄绿色 = 刺激后晚期）。
+6 种 conditional（3 种原生 + 3 种 trial-aware）在相同 MEG 数据集上训练。点颜色按 **trial 内时间**编码。
 
 ### 3D 嵌入（按时间着色）
 
 ![3D 嵌入](resources/fig_3d_embeddings.png)
 
-**原生 CEBRA（上排）：** `time` — 均匀球面，无时间结构。`time_delta` — 弱时间梯度。`delta` — 刺激内容主导，gap 帧塌缩为暗色团块。
+**原生 CEBRA（上排）：** `time` — 均匀球面，无时间结构。`delta` — 刺激内容主导，trial 内结构扁平。`time_delta` — 弱时间梯度。
 
-**Trial-aware TrialCEBRA（下排）：** `trialTime_delta` — 结构最清晰的时间环，gap 帧独立成簇。`trialTime` — 类似时间环，梯度更平滑。`trialDelta` — gap 清晰分离，trial 帧较分散。`trial_delta` — trial 帧嵌入更均匀。`trialTime_trialDelta` — 每潜伏期聚集程度最高。
+**Trial-aware TrialCEBRA（下排）：** `time` — 跨 trial 对齐产生的时间环。`delta` — 刺激相似度驱动的 trial 聚类。`time_delta` — 最清晰的潜伏期结构。
 
 ### 训练损失曲线
 
@@ -201,48 +182,61 @@ target_trial = argmin_j  dist(query, trial_mean[j])
 
 ---
 
-## Gap（试次间）时间点
+## 标签广播规则（Epoch 格式）
 
-Trial 边界之间的时间点作为**合法 anchor** 参与训练：
+当 `X` 为 3D `(ntrial, ntime, nneuro)` 时，标签自动广播为扁平格式：
 
-| `conditional` | Gap 策略 |
-|---|---|
-| `trialTime` | 全局 ±`time_offset` 窗口；有离散标签时 → 全类均匀（Gumbel-max） |
-| `trialDelta` | 时间点级 delta-style |
-| `trial_delta` | 时间点级 delta-style |
-| `trialTime_delta` | 时间点级 delta-style |
-| `trialTime_trialDelta` | 时间点级 time_delta-style |
-
-> **推荐做法：** 传入离散标签区分 trial 与 gap（如 `0 = gap`、`1 = trial`）。有离散标签时，`trialTime` 的 gap 策略切换为**全类均匀采样**（Gumbel-max trick），迫使所有 gap 时间点在嵌入空间全局聚集。
+| 标签形状 | 解释 | 扁平输出形状 |
+|---|---|---|
+| `(ntrial,)` | per-trial 离散 | `(ntrial*ntime,)` |
+| `(ntrial, d)`，`d ≠ ntime` | per-trial 连续 | `(ntrial*ntime, d)` |
+| `(ntrial, ntime)` | per-timepoint | `(ntrial*ntime,)` |
+| `(ntrial, ntime, d)` | per-timepoint | `(ntrial*ntime, d)` |
 
 ---
 
-## 离散标签支持
+## 多会话训练
 
-所有 conditional 均支持传入离散标签数组，有离散标签时：
-
-- `sample_prior` 使用**类平衡采样**（与原生 CEBRA `MixedDataLoader` 一致）。
-- Trial 选取限制在**同类 trial** 之间。
-- Gap 采样切换为**全类均匀**（Gumbel-max trick）。
+TrialCEBRA 在 trial-aware 采样之上对齐 CEBRA 原生的多会话哲学。把 `X` 传成 **list of epoch-format 数组**（每 session 一个），辅助标签同样按 list 给：
 
 ```python
-y_disc = np.zeros(N, dtype=np.int64)
-for s, e in zip(trial_starts, trial_ends):
-    y_disc[s:e] = 1
+# 2 个 session，每 session 形状可不同 (ntrial, ntime, nneuro)
+X = [
+    np.random.randn(30, 100, 64).astype(np.float32),   # session 0
+    np.random.randn(25,  80, 48).astype(np.float32),   # session 1（异构）
+]
+y_cont = [np.random.randn(30, 100, 16).astype(np.float32),
+          np.random.randn(25,  80, 16).astype(np.float32)]
+y_disc = [np.zeros((30, 100), dtype=np.int64), np.zeros((25, 80), dtype=np.int64)]
+# ... 设置 pre/post 类别 ...
 
-model.fit(X, y_cont, y_disc, trial_starts=trial_starts, trial_ends=trial_ends)
+model = TrialCEBRA(conditional="delta", max_iterations=1000, output_dimension=3, ...)
+model.fit(X, y_disc, y_cont)   # 自动检测 list-of-arrays 进入 multisession
 ```
 
-**仅离散标签（无连续标签）** 支持 `"trialTime"`：
+### 保留 CEBRA 哲学
 
-```python
-y_disc = np.zeros(ntrial, dtype=np.int64)
-y_disc[ntrial // 2:] = 1
+对齐力来自**跨 session query shuffle**（参考 `cebra.distributions.multisession.MultisessionSampler`）：每 session 在自己 y 空间算 query，所有 query 跨 session 重新分配，每个 positive 一定来自 ≠ anchor 所在 session 的 session，迫使各 session 的 encoder 把语义等价的状态映射到相近的 embedding。`mix` / `index_reversed` 在编码后把 ref ↔ pos 重新对齐，再送入对比损失。
 
-model.fit(X_ep, y_disc)   # X_ep: (ntrial, ntime, nneuro)
-```
+### 支持范围
 
-> Delta-style conditional 需要连续标签计算 trial 相似度，仅传离散标签时抛出 `ValueError`。
+| Conditional | Multi 支持 | 行为 |
+|---|---|---|
+| `"delta"` | ✓ 完整 | Mode A / Mode B 类条件 trial 选择按 session 独立；跨 session shuffle；同类约束跨 session 生效 |
+| `"time_delta"` | ✓ | y 空间 joint argmin；**±`time_offsets` 时间窗被丢弃**（ntime 异构时相对位置不可跨 session 对齐） |
+| `"time"` | ✗ `NotImplementedError` | 与 CEBRA 原生一致——`_init_loader` 在无行为索引时拒绝 multisession |
+
+### 校验规则（init 时）
+
+- **≥ 2 个 session**；允许 `(ntrial_s, ntime_s, nneuro_s)` 异构
+- 所有 session 共享相同的连续 y 特征维度 `nd`
+- 提供 `y_discrete` 时所有 session 必须共享**完全相同的 sorted unique class 集合**
+- multisession 下**禁止 Mode C**（per-timepoint 离散 + 2-D 连续）——必须每 session 都传 3-D `y_continuous`
+- 严格跨 session：每个 positive 都来自 ≠ anchor 所在 session 的 session（按 batch 位置对 session 轴做 derangement）
+
+### `sample_exclude_intrial` 在 multisession 下
+
+sampler 层已严格保证跨 session，单 session 的 `sample_exclude_intrial` 在此被覆盖。每 session 的 `TrialAwareDistribution` 内部用 `sample_exclude_intrial=False` 避免双重屏蔽。
 
 ---
 
@@ -254,17 +248,17 @@ model.fit(X_ep, y_disc)   # X_ep: (ntrial, ntime, nneuro)
 
 ```python
 TrialCEBRA(
-    conditional: str,      # trial-aware 或原生 CEBRA conditional
-    time_offsets: int,     # 时间窗半宽；同时用于 Δstim lag
-    delta: float,          # trial 选取的 Gaussian kernel 标准差
+    conditional: str,                    # "time"、"delta"、"time_delta" 或任意原生 CEBRA conditional
+    time_offsets: int,                   # trial 内时间窗半宽
+    delta: float,                        # trial 相似度匹配的 Gaussian 噪声标准差
+    sample_fix_trial: bool = False,      # 在 init 时预计算 trial→trial 映射
+    sample_exclude_intrial: bool = True, # 排除 anchor 所在 trial 进行正样本采样
     **cebra_kwargs,
 )
 
-# 扁平格式
-model.fit(X, *y, trial_starts, trial_ends, adapt=False, callback=None, callback_frequency=None)
-
 # Epoch 格式 —— trial 边界自动推导
 model.fit(X, *y)           # X: (ntrial, ntime, nneuro)
+model.fit_epochs(X, *y)    # convenience alias
 
 model.transform(X)         # → np.ndarray (N, output_dimension)
 model.transform_epochs(X)  # → np.ndarray (ntrial, ntime, output_dimension)
@@ -280,18 +274,31 @@ from trial_cebra import TrialAwareDistribution
 import torch
 
 dist = TrialAwareDistribution(
-    continuous   = torch.randn(500, 16),
-    trial_starts = torch.tensor([0, 100, 200, 300, 400]),
-    trial_ends   = torch.tensor([100, 200, 300, 400, 500]),
-    conditional  = "trial_delta",
-    time_offset  = 10,
-    delta        = 0.3,
-    device       = "cpu",
-    seed         = 42,
-    discrete     = None,   # 可选，(N,) int tensor
+    ntrial                 = 40,
+    ntime                  = 50,
+    conditional            = "delta",
+    y                      = torch.randn(40, 16),   # (ntrial, nd)
+    sample_fix_trial       = False,
+    sample_exclude_intrial = True,
+    time_offsets           = 10,
+    delta                  = 0.3,
+    device                 = "cpu",
+    seed                   = 42,
 )
 
-ref, pos = dist.sample_joint(num_samples=64)
+ref = dist.sample_prior(num_samples=64)
+pos = dist.sample_conditional(ref)
+```
+
+### `flatten_epochs`
+
+将 epoch 格式数组转换为扁平格式并附带 trial 元数据：
+
+```python
+from trial_cebra import flatten_epochs
+
+X_flat, y_flat, trial_starts, trial_ends = flatten_epochs(X_ep, y_ep)
+# X_ep: (ntrial, ntime, nneuro) → X_flat: (ntrial*ntime, nneuro)
 ```
 
 ### `TrialTensorDataset`
@@ -304,7 +311,6 @@ from trial_cebra import TrialTensorDataset
 dataset = TrialTensorDataset(
     neural       = neural_tensor,
     continuous   = stim_tensor,
-    discrete     = label_tensor,   # 可选
     trial_starts = starts_tensor,
     trial_ends   = ends_tensor,
     device       = "cpu",
@@ -317,7 +323,7 @@ dataset = TrialTensorDataset(
 
 **Post-replace distribution** —— `TrialCEBRA` 不修改 CEBRA 源码。它临时将 `conditional = "time_delta"` 以通过 CEBRA 内部校验，调用 `super()._prepare_loader(...)` 获取标准 Loader，再将 `loader.distribution` 原地替换为 `TrialAwareDistribution`。两种 Loader 在 `get_indices` 中均只调用 `distribution.sample_prior` 和 `distribution.sample_conditional`，因此替换对训练循环完全透明。
 
-**混合标签路由** —— 同时传入离散和连续标签时，CEBRA 始终创建 `MixedDataLoader`（硬编码，忽略 `conditional`）。`TrialCEBRA` 继承该路由后立即替换分布，`conditional` 仅对 `TrialAwareDistribution` 生效。
+conditional 命名冲突（`"time"` 和 `"time_delta"` 同时是 CEBRA 原生名称和 TrialCEBRA conditional 名称）通过检测 dataset 上的 trial 元数据来解决：仅当 `trial_starts`/`trial_ends` 存在于 dataset 时才激活 trial-aware 路径，确保传入扁平 2D 数据时完全沿用原生 CEBRA 行为。
 
 ---
 
@@ -328,7 +334,7 @@ src/trial_cebra/
   __init__.py       公开 API：TrialCEBRA, TrialTensorDataset, TrialAwareDistribution, flatten_epochs
   cebra.py          TrialCEBRA sklearn 估计器
   dataset.py        TrialTensorDataset（PyTorch 数据集）
-  distribution.py   TrialAwareDistribution（5 种 conditional 全部实现）
+  distribution.py   TrialAwareDistribution（三种 trial-aware conditional）
   epochs.py         flatten_epochs 工具函数
 
 tests/

@@ -1,740 +1,936 @@
-"""Trial-aware distributions for hierarchical contrastive sampling.
+"""Trial-aware distributions for epoch-format contrastive sampling.
 
-Five trial-aware conditionals based on three orthogonal axes
-(trial selection × time constraint × locking):
+Three conditionals mirroring CEBRA's originals, lifted to trial level:
 
-  ===========================  ================  ==============  =========
-  ``conditional``              Trial selection   Time constraint  Locking
-  ===========================  ================  ==============  =========
-  ``"trialTime"``              Random            ±time_offset    —
-  ``"trialDelta"``             delta-style       Free            Locked
-  ``"trial_delta"``            delta-style       Free            Re-sampled
-  ``"trialTime_delta"``        delta-style       ±time_offset    Re-sampled
-  ``"trialTime_trialDelta"``   time_delta-style  ±time_offset    Locked
-  ===========================  ================  ==============  =========
+  ===============  ===============  ================  ==============================
+  ``conditional``  Trial selection  Within-trial      y required
+  ===============  ===============  ================  ==============================
+  ``"time"``       Random           ±time_offsets     None
+  ``"delta"``      delta-style      Uniform (free)    (ntrial, nd) or
+                                                      (ntrial, ntime, nd)
+  ``"time_delta"`` joint argmin     ±time_offsets     (ntrial, ntime, nd)
+  ===============  ===============  ================  ==============================
 
-Trial selection principles mirror CEBRA's own conditionals:
+``sample_fix_trial`` (bool, default False):
+  True  — pre-compute a fixed trial→trial mapping at init (one draw per trial).
+  False — re-sample target trial independently at each training step.
+  Ignored for ``"time"`` (always random).
 
-  **delta-style** (``trialDelta``, ``trial_delta``):
-    Follows CEBRA's ``DeltaNormalDistribution``.  A query is formed by adding
-    isotropic Gaussian noise to the anchor's trial-mean embedding::
+``sample_exclude_intrial`` (bool, default True):
+  True  — positive samples are always drawn from a different trial (cross-trial).
+  False — positive samples may come from any trial, including the anchor's own.
+          For ``"delta"`` without ``y_discrete``, the trial selection switches
+          from deterministic ``argmin`` to stochastic Gumbel-max sampling
+          (softmax(-dists/T) with T=delta).  Pure ``argmin`` would otherwise
+          collapse to "always self trial" in high dimensions because Gaussian
+          noise of std ``delta`` is mostly orthogonal to inter-trial offsets
+          and cannot escape self-similarity.  Stochastic selection biases
+          toward similar trials but does not pin to self.  Note that even
+          with this fix the resulting embedding may have limited structure
+          when no ``y_discrete`` is supplied — InfoNCE benefits substantially
+          from the same-class constraint that ``y_discrete`` provides.
 
-        query = trial_mean[anchor] + N(0, δ²I)
-        target_trial = argmin_j  dist(query, trial_mean[j])
+``y_discrete`` (optional LongTensor, shape ``(ntrial*ntime,)``):
+  Per-timepoint discrete class labels in flat epoch format.  When provided:
 
-    δ controls the exploration radius in trial-embedding space.  Because the
-    noise is freshly sampled each training step, different steps map the same
-    anchor to different target trials, providing structured diversity.
+  * **Prior** (controlled by ``sample_prior``):
+      - ``"balanced"`` (default): uniform over classes, then uniform within
+        the selected class.  Equalises class representation in anchors but
+        oversamples minority classes by ``1 / class_freq``.
+      - ``"uniform"``: uniform over all timepoints; class frequency in
+        anchors matches the empirical distribution.  Use this for severely
+        imbalanced labels where ``"balanced"`` would distort the prior.
+  * **Conditional**: same-class constraint — positives must carry the same
+    discrete label as the anchor.  Falls back to unconstrained sampling for
+    the rare case where no same-class candidate exists in the target pool.
 
-  **time_delta-style** (``trialTime_delta``, ``trialTime_trialDelta``):
-    Follows CEBRA's ``TimedeltaDistribution``.  A query is formed by adding a
-    randomly-drawn empirical stim-velocity vector to the anchor's trial-mean::
+``sample_prior`` only affects the anchor distribution; the same-class
+conditional constraint is applied independently.
 
-        Δstim[k] = continuous[k] - continuous[k - time_offset]  (pre-computed)
-        query    = trial_mean[anchor] + Δstim[random_k]
-        target_trial = argmin_j  dist(query, trial_mean[j])
+Discrete-first principle (only ``"delta"`` path):
+  Following CEBRA's ``ConditionalIndex`` design, when ``y_discrete`` is
+  supplied the trial-selection step uses **class-conditional** trial
+  embeddings whenever possible:
 
-    This mirrors the data-driven perturbation of CEBRA's ``time_delta``,
-    transposed from the timepoint level to the trial level.
+    * Mode A — discrete is per-trial (constant within each trial):
+      candidates restricted to trials sharing the anchor's class.
+    * Mode B — discrete is per-timepoint AND ``y`` is 3-D:
+      ``trial_emb_per_class[c][trial] = mean(y[trial, t]
+      for t where class(trial,t) == c)``; the anchor uses its own class's
+      basis to query trials.
+    * Mode C — discrete is per-timepoint but ``y`` is only 2-D: a warning
+      is emitted at init and trial selection falls back to class-agnostic
+      ``trial_emb`` (same-class still applied at the timepoint stage).
 
-Naming convention:
-  - ``trialDelta`` (capital D, no underscore) = Locked delta-style trial.
-  - ``trial_delta`` (underscore, lowercase d) = Re-sampled delta-style trial.
-  - ``_delta`` and ``_trialDelta`` suffixes denote the trial-selection mechanism.
+  In all modes a tiny Gumbel perturbation is added to ``dists`` before
+  ``argmin`` to break ties stochastically (e.g., when all trials share the
+  same class-c embedding, as happens for pre-stim gray-screen labels).
 
-Trial-level locking (``trialDelta``, ``trialTime_trialDelta``):
-  A fixed ``ref_trial → target_trial`` mapping is pre-computed once at
-  ``__init__`` time using the respective query mechanism (delta-style or
-  time_delta-style, one noise/diff sample per trial).
+y semantics:
+  ``"delta"``      — 2-D ``(ntrial, nd)`` (per-trial) or 3-D
+                     ``(ntrial, ntime, nd)`` (per-timepoint).  3-D is
+                     required for Mode B class-conditional trial selection.
+  ``"time_delta"`` — 3-D ``(ntrial, ntime, nd)``;  ``trial_emb = y[:, 0, :]``
+                     (trial-onset embedding, no mean aggregation).
 
-Re-sampled (``trial_delta``, ``trialTime_delta``):
-  Target trial is independently re-sampled at each training step, providing
-  more diverse positive pairs.
+``"time_delta"`` sampling (fix_trial=False):
+  For anchor (trial_i, rel_i), the candidate pool is all cross-trial timepoints
+  within ±time_offsets of rel_i::
 
-Gap (inter-trial) timepoint handling:
+      {(trial_j, t) : trial_j ≠ trial_i, |t − rel_i| ≤ time_offsets}
 
-  ===========================  ========================
-  ``conditional``              Gap strategy
-  ===========================  ========================
-  ``"trialTime"``              Global ±time_offset
-  ``"trialDelta"``             delta-style (timepoint)
-  ``"trial_delta"``            delta-style (timepoint)
-  ``"trialTime_delta"``        delta-style (timepoint)
-  ``"trialTime_trialDelta"``   time_delta-style (tp)
-  ===========================  ========================
+  The positive is chosen as the argmin in y-space after adding Gaussian noise to
+  the anchor's y query.  On static stimuli (constant y within trial) this
+  degrades gracefully to delta-style trial selection + time-window sampling.
 
-When a discrete index is provided, positive samples are restricted to the
-same discrete class as the reference (trial selection and gap sampling both
-respect this constraint).
+``"time_delta"`` sampling (fix_trial=True):
+  Target trial is locked at init (same Gaussian-similarity query as ``"delta"``
+  on trial-onset embeddings).  At each step the within-trial timepoint is the
+  argmin of y-distance inside the ±time_offsets window of the locked trial.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional
 
 import cebra.distributions.base as abc_
 import torch
-from cebra.data.datatypes import Offset
-from cebra.distributions.discrete import DiscreteUniform
 
-TRIAL_CONDITIONALS = frozenset(
-    {"trialTime", "trialDelta", "trial_delta", "trialTime_delta", "trialTime_trialDelta"}
-)
+TRIAL_CONDITIONALS = frozenset({"time", "delta", "time_delta"})
+PRIOR_MODES = frozenset({"uniform", "balanced"})
 
-# Conditionals that require trial-level embeddings and query-based selection
-_NEEDS_SIMILARITY = frozenset(
-    {"trialDelta", "trial_delta", "trialTime_delta", "trialTime_trialDelta"}
-)
+# Class-conditional mode tags used internally when y_discrete is provided
+# with conditional == "delta".  See _detect_disc_mode() for selection logic.
+_DISC_MODE_NONE = "none"  # no y_discrete
+_DISC_MODE_PER_TRIAL = "per_trial"  # each trial has a single class
+_DISC_MODE_PER_TP_3D = "per_tp_3d"  # per-timepoint class + 3-D y (full class-cond)
+_DISC_MODE_PER_TP_2D = "per_tp_2d_fallback"  # per-timepoint class + 2-D y (cannot class-cond)
 
-# trial selection follows CEBRA's delta principle (isotropic Gaussian query)
-_NEEDS_DELTA_TRIAL = frozenset({"trialDelta", "trial_delta"})
-
-# trial selection follows CEBRA's time_delta principle (empirical stim-diff query)
-# Note: trialTime_delta uses delta-style selection + ±time_offset window (NOT pool-based).
-_NEEDS_TIMEDELT_TRIAL = frozenset({"trialTime_trialDelta"})
-
-# Conditionals that use trial-level locking (_locked_target_trials)
-_NEEDS_LOCKING = frozenset({"trialDelta", "trialTime_trialDelta"})
+# Chunk size for the joint argmin loop (controls peak VRAM).
+# Peak tensor: (chunk, ntrial*W, nd) — e.g. 16×4200×768×4 ≈ 206 MB.
+_ARGMIN_CHUNK = 4
 
 
 class TrialAwareDistribution(abc_.JointDistribution, abc_.HasGenerator):
-    """Trial-aware hierarchical sampling distribution.
+    """Trial-aware hierarchical sampling distribution for epoch-format data.
 
     Args:
-        continuous: Continuous auxiliary variable per timepoint, shape ``(N, d)``.
-        trial_starts: Start index of each trial (inclusive), shape ``(T,)``.
-        trial_ends: End index of each trial (exclusive), shape ``(T,)``.
-        conditional: Sampling mode.  One of ``"trialTime"``, ``"trialDelta"``,
-            ``"trial_delta"``, ``"trialTime_delta"``, ``"trialTime_trialDelta"``.
-        time_offset: Half-width of the within-trial (or pool) time window.
-            Also used as the lag for pre-computing ``Δstim`` in
-            time_delta-style conditionals.
-        delta: Standard deviation of the isotropic Gaussian noise used for
-            delta-style trial selection (``trialDelta``, ``trial_delta``) and
-            delta-style gap sampling.  ``None`` falls back to deterministic
-            nearest-neighbour.  Required (non-None) for delta-style conditionals.
-        device: Compute device.
-        seed: Random seed for the generator.
-        discrete: Integer class label per timepoint, shape ``(N,)``.
-            Positive samples are restricted to the same class.
-
-    Example — ``trialTime``::
-
-        >>> import torch
-        >>> continuous   = torch.randn(500, 10)
-        >>> trial_starts = torch.tensor([0, 100, 200, 300, 400])
-        >>> trial_ends   = torch.tensor([100, 200, 300, 400, 500])
-        >>> dist = TrialAwareDistribution(
-        ...     continuous=continuous,
-        ...     trial_starts=trial_starts,
-        ...     trial_ends=trial_ends,
-        ...     conditional="trialTime",
-        ...     time_offset=10,
-        ... )
-        >>> ref, pos = dist.sample_joint(num_samples=32)
-
-    Example — ``trialDelta`` (locked delta-style + uniform in trial)::
-
-        >>> dist = TrialAwareDistribution(
-        ...     continuous=continuous,
-        ...     trial_starts=trial_starts,
-        ...     trial_ends=trial_ends,
-        ...     conditional="trialDelta",
-        ...     time_offset=10,
-        ...     delta=0.1,
-        ... )
-        >>> ref, pos = dist.sample_joint(num_samples=32)
-
-    Example — ``trial_delta`` (re-sampled delta-style + free)::
-
-        >>> dist = TrialAwareDistribution(
-        ...     continuous=continuous,
-        ...     trial_starts=trial_starts,
-        ...     trial_ends=trial_ends,
-        ...     conditional="trial_delta",
-        ...     time_offset=10,
-        ...     delta=0.1,
-        ... )
-        >>> ref, pos = dist.sample_joint(num_samples=32)
-
-    Example — ``trialTime_delta`` (re-sampled delta-style + ±offset window)::
-
-        >>> dist = TrialAwareDistribution(
-        ...     continuous=continuous,
-        ...     trial_starts=trial_starts,
-        ...     trial_ends=trial_ends,
-        ...     conditional="trialTime_delta",
-        ...     time_offset=10,
-        ...     delta=0.1,
-        ... )
-        >>> ref, pos = dist.sample_joint(num_samples=32)
-
-    Example — ``trialTime_trialDelta`` (locked time_delta-style + ±offset)::
-
-        >>> dist = TrialAwareDistribution(
-        ...     continuous=continuous,
-        ...     trial_starts=trial_starts,
-        ...     trial_ends=trial_ends,
-        ...     conditional="trialTime_trialDelta",
-        ...     time_offset=10,
-        ...     delta=0.1,
-        ... )
-        >>> ref, pos = dist.sample_joint(num_samples=32)
+        ntrial:               Number of trials.
+        ntime:                Timepoints per trial (equal-length trials assumed).
+        conditional:          Sampling mode — ``"time"``, ``"delta"``, or ``"time_delta"``.
+        y:                    Label tensor.  Shape ``(ntrial, nd)`` for ``"delta"``;
+                              ``(ntrial, ntime, nd)`` for ``"time_delta"``; ``None`` for
+                              ``"time"``.
+        y_discrete:           Optional per-timepoint discrete labels, flat shape
+                              ``(ntrial*ntime,)``.  Enables class-balanced prior and
+                              same-class conditional constraint.
+        sample_prior:         ``"balanced"`` (default) for class-balanced anchor
+                              sampling when ``y_discrete`` is provided;
+                              ``"uniform"`` for frequency-weighted sampling (uniform
+                              over all timepoints).  Ignored when ``y_discrete`` is
+                              ``None``.
+        sample_fix_trial:     If ``True``, pre-compute a fixed trial-to-trial mapping at
+                              init.  Ignored for ``"time"``.
+        sample_exclude_intrial: If ``True`` (default), positive samples are always from a
+                              different trial than the anchor.  If ``False``, any trial
+                              (including the anchor's own) may be selected.
+        time_offsets:         Half-width of the within-trial time window (used by ``"time"``
+                              and ``"time_delta"``).
+        delta:                Gaussian noise std for delta-style trial selection.
+        device:               Compute device.
+        seed:                 RNG seed.
     """
 
     def __init__(
         self,
-        continuous: Optional[torch.Tensor],
-        trial_starts: torch.Tensor,
-        trial_ends: torch.Tensor,
+        ntrial: int,
+        ntime: int,
         conditional: str,
-        time_offset: int = 10,
-        delta: Optional[float] = None,
+        y: Optional[torch.Tensor] = None,
+        y_discrete: Optional[torch.Tensor] = None,
+        sample_fix_trial: bool = False,
+        sample_exclude_intrial: bool = True,
+        sample_prior: str = "balanced",
+        time_offsets: int = 10,
+        delta: float = 0.1,
         device: str = "cpu",
         seed: Optional[int] = None,
-        discrete: Optional[torch.Tensor] = None,
     ):
         abc_.HasGenerator.__init__(self, device=device, seed=seed)
 
-        # --- Validate conditional ---
         if conditional not in TRIAL_CONDITIONALS:
             raise ValueError(
                 f"Unknown conditional: {conditional!r}. "
                 f"Must be one of {sorted(TRIAL_CONDITIONALS)}."
             )
-        if continuous is None and conditional in _NEEDS_SIMILARITY:
+
+        if sample_prior not in PRIOR_MODES:
             raise ValueError(
-                f"conditional='{conditional}' requires continuous labels for "
-                "trial similarity matching.  Use 'trialTime' for discrete-only data."
+                f"Unknown sample_prior: {sample_prior!r}. Must be one of {sorted(PRIOR_MODES)}."
             )
 
-        # --- Core attributes ---
-        self.continuous = continuous.to(device) if continuous is not None else None
-        self.trial_starts = trial_starts.long().to(device)
-        self.trial_ends = trial_ends.long().to(device)
-        self.conditional = conditional
-        self.time_offset = time_offset
-        self.delta = delta
-        self.num_trials = len(trial_starts)
-
-        # --- Validate trial metadata ---
-        if self.num_trials == 0:
-            raise ValueError("At least one trial must be provided.")
-        if len(trial_starts) != len(trial_ends):
-            raise ValueError(
-                f"trial_starts ({len(trial_starts)}) and trial_ends "
-                f"({len(trial_ends)}) must have the same length."
-            )
-        if not torch.all(self.trial_starts < self.trial_ends):
-            raise ValueError("All trial_starts must be < trial_ends.")
-        if self.num_trials < 2:
+        if ntrial < 2:
             raise ValueError("At least 2 trials are required for cross-trial sampling.")
 
-        self.trial_lengths = self.trial_ends - self.trial_starts
+        self.ntrial = ntrial
+        self.ntime = ntime
+        self.conditional = conditional
+        self.sample_fix_trial = sample_fix_trial
+        self.sample_exclude_intrial = sample_exclude_intrial
+        self.sample_prior_mode = sample_prior
+        self.time_offsets = time_offsets
+        self.delta = delta
 
-        # --- Discrete index ---
-        if discrete is not None:
-            self.discrete = discrete.long().to(device)
-            self.trial_discrete = self.discrete[self.trial_starts]  # (T,)
-            self._trial_same_class = torch.eq(
-                self.trial_discrete.unsqueeze(1),  # (T, 1)
-                self.trial_discrete.unsqueeze(0),  # (1, T)
-            )  # (T, T)
-            # Class-balanced prior (same design as native CEBRA's MixedDataLoader)
-            self._discrete_prior = DiscreteUniform(self.discrete.cpu())
+        # Validate y shape against conditional
+        if conditional == "delta":
+            # Accept 2-D (per-trial) or 3-D (per-timepoint) y.
+            # The 3-D form enables class-conditional trial embeddings when
+            # y_discrete is also provided (see _detect_disc_mode).
+            if y is None or y.ndim not in (2, 3) or y.shape[0] != ntrial:
+                raise ValueError(
+                    f"conditional='delta' requires y of shape (ntrial={ntrial}, nd) "
+                    f"or (ntrial={ntrial}, ntime={ntime}, nd); "
+                    f"got {None if y is None else tuple(y.shape)}."
+                )
+            if y.ndim == 3 and y.shape[1] != ntime:
+                raise ValueError(
+                    f"3-D y for conditional='delta' must have shape "
+                    f"(ntrial={ntrial}, ntime={ntime}, nd); got {tuple(y.shape)}."
+                )
+            y = y.to(device)
+            self._y_delta_3d = (
+                y if y.ndim == 3 else None
+            )  # only kept for Mode B; cleared after init
+            if y.ndim == 2:
+                self.trial_emb = y  # (ntrial, nd)
+            else:
+                self.trial_emb = y.mean(dim=1)  # (ntrial, nd) — class-agnostic mean
+
+        elif conditional == "time_delta":
+            if y is None or y.ndim != 3 or y.shape[:2] != (ntrial, ntime):
+                raise ValueError(
+                    f"conditional='time_delta' requires y of shape "
+                    f"(ntrial={ntrial}, ntime={ntime}, nd); "
+                    f"got {None if y is None else tuple(y.shape)}. "
+                    "y must be 3-D timepoint-level labels."
+                )
+            y = y.to(device)
+            self.trial_emb = y[:, 0, :]  # (ntrial, nd) — onset, no mean
+            self._y_flat = y.reshape(ntrial * ntime, -1)  # (ntrial*ntime, nd)
+            self._y_norm2 = (self._y_flat**2).sum(-1)  # (ntrial*ntime,) — precomputed for fast dist
+
+        # Discrete labels: class-balanced prior + same-class conditional constraint
+        if y_discrete is not None:
+            yd = y_discrete.reshape(-1).to(device).long()
+            if yd.numel() != ntrial * ntime:
+                raise ValueError(
+                    f"y_discrete must have ntrial*ntime={ntrial * ntime} elements; "
+                    f"got {yd.numel()}."
+                )
+            self._y_discrete = yd  # (ntrial*ntime,)
+            classes = yd.unique(sorted=True)
+            self._n_classes = classes.numel()
+            # Per-class indices (concatenated) + offsets and sizes for vectorized sampling
+            idx_list, offsets, sizes = [], [], []
+            offset = 0
+            for c in classes:
+                idx = (yd == c).nonzero(as_tuple=True)[0]
+                idx_list.append(idx)
+                offsets.append(offset)
+                sizes.append(idx.numel())
+                offset += idx.numel()
+            self._class_indices_flat = torch.cat(idx_list)  # (ntrial*ntime,) by class
+            self._class_offsets = torch.tensor(
+                offsets, dtype=torch.long, device=device
+            )  # (n_classes,)
+            self._class_sizes = torch.tensor(sizes, dtype=torch.long, device=device)  # (n_classes,)
+            self._classes_sorted = classes  # (n_classes,) for value→idx
+
+            # Class-conditional structures for delta path.
+            # Mode A (per_trial):     each trial constant class    -> filter trials by class
+            # Mode B (per_tp_3d):     class varies + 3-D y         -> trial_emb_per_class
+            # Mode C (per_tp_2d):     class varies + 2-D y         -> warn, fall back
+            self._disc_mode = self._build_class_conditional_state(yd, conditional, device)
         else:
-            self.discrete = None
+            self._disc_mode = _DISC_MODE_NONE
 
-        # --- Timepoint → trial mapping (-1 for gap timepoints) ---
-        N = len(self.continuous) if self.continuous is not None else int(self.trial_ends.max())
-        self.timepoint_to_trial = torch.full((N,), -1, dtype=torch.long, device=device)
-        for t in range(self.num_trials):
-            s, e = int(self.trial_starts[t]), int(self.trial_ends[t])
-            self.timepoint_to_trial[s:e] = t
+        # _y_delta_3d is only used inside _build_class_conditional_state for
+        # Mode B aggregation. Drop it (and its HasDevice registration) now.
+        if hasattr(self, "_y_delta_3d"):
+            self._tensors.discard("_y_delta_3d")
+            object.__setattr__(self, "_y_delta_3d", None)
 
-        # --- Timepoint relative position within its trial (-1 for gap) ---
-        self.timepoint_rel_pos = torch.full((N,), -1, dtype=torch.long, device=device)
-        for t in range(self.num_trials):
-            s, e = int(self.trial_starts[t]), int(self.trial_ends[t])
-            self.timepoint_rel_pos[s:e] = torch.arange(e - s, device=device)
-
-        # Convenience: all trial timepoint indices concatenated
-        self._all_trial_indices = torch.cat(
-            [
-                torch.arange(int(self.trial_starts[t]), int(self.trial_ends[t]), device=device)
-                for t in range(self.num_trials)
-            ]
-        )
-
-        # --- Trial-level embeddings (mean of each trial's continuous index) ---
-        if conditional in _NEEDS_SIMILARITY:
-            trial_embs = [
-                self.continuous[int(self.trial_starts[t]) : int(self.trial_ends[t])].mean(dim=0)
-                for t in range(self.num_trials)
-            ]
-            self.trial_embeddings = torch.stack(trial_embs).to(device)  # (T, d)
-
-            # time_delta-style: pre-compute timepoint-level stim velocity vectors.
-            # Identical construction to CEBRA's TimedeltaDistribution:
-            #   _time_difference[k] = continuous[k] - continuous[k - time_offset]
-            if conditional in _NEEDS_TIMEDELT_TRIAL:
-                td = self.time_offset
-                _diff = torch.zeros_like(self.continuous)  # (N, d)
-                _diff[td:] = self.continuous[td:] - self.continuous[:-td]
-                self._time_difference = _diff  # (N, d)
-
-        # --- Pre-computed locked target trials ---
-        if conditional in _NEEDS_LOCKING:
-            self._locked_target_trials = self._compute_locked_trials()  # (T,)
+        # Pre-compute locked trial mapping if requested (not applicable for "time")
+        if sample_fix_trial and conditional != "time":
+            all_trials = torch.arange(ntrial, device=device)
+            if conditional == "delta" and self._disc_mode in (
+                _DISC_MODE_PER_TRIAL,
+                _DISC_MODE_PER_TP_3D,
+            ):
+                # Per-class locked targets: shape (n_classes, ntrial).
+                # For each (class, trial) pair, what's the class-conditional target?
+                locked = torch.zeros(self._n_classes, ntrial, dtype=torch.long, device=device)
+                for ci in range(self._n_classes):
+                    c_val = self._classes_sorted[ci]
+                    anchor_cls = torch.full_like(all_trials, int(c_val.item()))
+                    locked[ci] = self._class_conditional_trial_select(all_trials, anchor_cls)
+                self._locked_target_trials_per_class = locked
+            else:
+                # Native behavior: class-agnostic trial_emb-based selection
+                self._locked_target_trials = self._delta_trial_select(all_trials)
 
     # ------------------------------------------------------------------
-    # Public sampling API
+    # Public API
     # ------------------------------------------------------------------
 
-    def sample_prior(self, num_samples: int, offset: Optional[Offset] = None) -> torch.Tensor:
-        """Sample reference timepoints for use as anchors and negatives.
+    def sample_prior(self, num_samples: int, offset=None) -> torch.Tensor:
+        """Sample anchor indices.
 
-        When no discrete index is provided, samples uniformly over all ``N``
-        timepoints (original behaviour).
-
-        When a discrete index is present, delegates to
-        :py:class:`~cebra.distributions.discrete.DiscreteUniform` so that
-        every discrete class is equally likely regardless of class size —
-        matching the design of native CEBRA's ``MixedDataLoader``.
-
-        Args:
-            num_samples: Number of samples to draw.
-            offset: Unused; kept for API compatibility with CEBRA base class.
-
-        Returns:
-            Integer tensor of shape ``(num_samples,)``.
+        Without ``y_discrete``: uniform over ``[0, ntrial * ntime)``.
+        With ``y_discrete``:
+          * ``sample_prior="balanced"`` — uniform over classes, then uniform
+            within the selected class (oversamples minority classes).
+          * ``sample_prior="uniform"`` — uniform over all timepoints; class
+            frequency in anchors matches the empirical distribution.
         """
-        if self.discrete is None:
-            N = len(self.continuous) if self.continuous is not None else int(self.trial_ends.max())
-            return self.randint(0, N, (num_samples,))
-        return self._discrete_prior.sample_prior(num_samples).to(self.device)
+        if not hasattr(self, "_y_discrete") or self.sample_prior_mode == "uniform":
+            return self.randint(0, self.ntrial * self.ntime, (num_samples,))
+
+        # Class-balanced: pick class uniformly, then pick random sample within class
+        class_idx = self.randint(0, self._n_classes, (num_samples,))  # (B,)
+        within_size = self._class_sizes[class_idx]  # (B,)
+        within_off = (
+            torch.rand(num_samples, device=self.device, generator=self.generator)
+            * within_size.float()
+        ).long()  # (B,)
+        flat_ptr = self._class_offsets[class_idx] + within_off
+        return self._class_indices_flat[flat_ptr]
 
     def sample_conditional(self, reference_idx: torch.Tensor) -> torch.Tensor:
-        """Sample positive pairs according to the configured conditional.
+        """Sample positive timepoints for each reference anchor."""
+        dispatch = {
+            "time": self._sample_time,
+            "delta": self._sample_delta,
+            "time_delta": self._sample_time_delta,
+        }
+        return dispatch[self.conditional](reference_idx)
+
+    # ------------------------------------------------------------------
+    # Multisession primitives: compute_query / search_given_query
+    #
+    # These decouple the "build a y-space query from the anchor" step from the
+    # "find a positive given a query" step, so the query can be shuffled across
+    # sessions before searching in a target session (CEBRA multisession
+    # philosophy).  Single-session ``sample_conditional`` is untouched.
+    #
+    # Supported for ``conditional in {"delta", "time_delta"}`` only; ``"time"``
+    # has no continuous query to shuffle (CEBRA natively rejects time in
+    # multisession via ``_init_loader`` incompatible combinations).
+    # ------------------------------------------------------------------
+
+    def compute_query(self, ref: torch.Tensor):
+        """Compute a y-space query with Gaussian noise for multisession shuffle.
 
         Args:
-            reference_idx: Reference timepoint indices, shape ``(B,)``.
+            ref: (B,) flat reference indices in this session.
 
         Returns:
-            Positive timepoint indices, shape ``(B,)``.
+            ``(query, anchor_class)``:
+                query: ``(B, nd)`` y-space query (per-session).
+                anchor_class: ``(B,)`` long, or ``None`` when ``y_discrete`` is absent.
         """
-        if reference_idx.dim() != 1:
-            raise ValueError(f"Reference indices must be 1D, got shape {reference_idx.shape}.")
-        _dispatch = {
-            "trialTime": self._sample_trial_time,
-            "trialDelta": self._sample_trial_delta,
-            "trial_delta": self._sample_trial_delta_resampled,
-            "trialTime_delta": self._sample_trial_time_delta,
-            "trialTime_trialDelta": self._sample_trial_time_trial_delta,
-        }
-        return _dispatch[self.conditional](reference_idx)
+        if self.conditional == "time":
+            raise NotImplementedError(
+                "compute_query is not supported for conditional='time'. "
+                "CEBRA natively rejects time in multisession."
+            )
+        ref.size(0)
+        ref_trial = ref // self.ntime
+        anchor_class = self._y_discrete[ref] if hasattr(self, "_y_discrete") else None
 
-    # ------------------------------------------------------------------
-    # Per-conditional sampling implementations
-    # ------------------------------------------------------------------
+        if self.conditional == "delta":
+            if anchor_class is not None and self._disc_mode == _DISC_MODE_PER_TP_3D:
+                class_idx = self._class_value_to_idx(anchor_class)
+                # avoid (B, ntrial, nd) — gather per-anchor trial embedding directly
+                # _trial_emb_per_class is a stacked (n_classes, ntrial, nd) tensor;
+                # use advanced indexing: [class_idx, ref_trial] → (B, nd)
+                mean = self._trial_emb_per_class[class_idx, ref_trial]  # (B, nd)
+            else:
+                mean = self.trial_emb[ref_trial]  # (B, nd)
+        else:  # time_delta
+            mean = self._y_flat[ref]  # (B, nd)
 
-    def _sample_trial_time(self, reference_idx: torch.Tensor) -> torch.Tensor:
-        """``trialTime``: uniform random target trial + ±time_offset window.
+        noise = torch.empty_like(mean).normal_(generator=self.generator)
+        noise = noise * self.delta / (mean.size(-1) ** 0.5)
+        return mean + noise, anchor_class
 
-        Trial anchors:  pick a target trial uniformly at random (≠ own trial),
-                        sample within ±time_offset of the reference's relative
-                        position inside the target trial.
-        Gap anchors:    global ±time_offset window sampling.
+    def search_given_query(
+        self,
+        query: torch.Tensor,
+        anchor_class: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Find positive flat-idx in THIS session given a y-space query.
+
+        Designed for multisession cross-session use where the query may have
+        been produced by a different session and shuffled in.  No time window
+        and no self-trial exclusion are applied — cross-session property is
+        ensured at the sampler layer.  Same-class constraint is enforced if
+        ``anchor_class`` is provided.
+
+        Args:
+            query: ``(B, nd)``.
+            anchor_class: optional ``(B,)`` long tensor.  Values must exist
+                in this session's ``_classes_sorted`` (guaranteed by the
+                multisession sampler via class-set validation).
+
+        Returns:
+            ``(B,)`` positive flat-idx in ``[0, ntrial * ntime)``.
         """
-        ref_trial_ids = self.timepoint_to_trial[reference_idx]
-        is_trial = ref_trial_ids >= 0
-        positive_idx = torch.empty_like(reference_idx)
+        if self.conditional == "time":
+            raise NotImplementedError("search_given_query is not supported for conditional='time'.")
+        B = query.size(0)
 
-        if is_trial.any():
-            ref_t = reference_idx[is_trial]
-            ref_trial = ref_trial_ids[is_trial]
-            ref_rel = ref_t - self.trial_starts[ref_trial]
+        if self.conditional == "delta":
+            return self._search_given_query_delta(query, anchor_class, B)
+        # time_delta
+        return self._search_given_query_time_delta(query, anchor_class, B)
 
-            target_trial = self._uniform_other_trial(ref_trial)
+    def _search_given_query_delta(
+        self,
+        query: torch.Tensor,
+        anchor_class: Optional[torch.Tensor],
+        B: int,
+    ) -> torch.Tensor:
+        """Trial select on given query, then class-aware uniform within trial.
 
-            t_start = self.trial_starts[target_trial]
-            t_len = self.trial_lengths[target_trial]
-            t_rel = torch.clamp(ref_rel, max=t_len - 1)
-            low = torch.clamp(t_rel - self.time_offset, min=0)
-            high = torch.clamp(t_rel + self.time_offset + 1, max=t_len)
-            positive_idx[is_trial] = t_start + low + self._randint_range(low, high)
-
-        if (~is_trial).any():
-            positive_idx[~is_trial] = self._gap_by_time(reference_idx[~is_trial])
-
-        return positive_idx
-
-    def _sample_trial_delta(self, reference_idx: torch.Tensor) -> torch.Tensor:
-        """``trialDelta``: locked delta-style target trial + uniform in trial.
-
-        Trial anchors:  use pre-computed ``_locked_target_trials`` mapping
-                        (delta-style, fixed at init); sample uniformly from
-                        the entire target trial.
-        Gap anchors:    delta-style content sampling (timepoint level).
+        Class-conditional trial selection replicates the logic of
+        :py:meth:`_class_conditional_trial_select` but without self exclusion
+        (multisession context).  A small Gumbel perturbation on dists handles
+        ties (e.g., all trials sharing the same class-c embedding).
         """
-        ref_trial_ids = self.timepoint_to_trial[reference_idx]
-        is_trial = ref_trial_ids >= 0
-        positive_idx = torch.empty_like(reference_idx)
-
-        if is_trial.any():
-            ref_trial = ref_trial_ids[is_trial]
-            target_trial = self._locked_target_trials[ref_trial]
-
-            t_start = self.trial_starts[target_trial]
-            t_len = self.trial_lengths[target_trial]
-            rand_off = (
-                torch.rand(ref_trial.size(0), device=self.device, generator=self.generator)
-                * t_len.float()
-            ).long()
-            positive_idx[is_trial] = t_start + rand_off
-
-        if (~is_trial).any():
-            positive_idx[~is_trial] = self._gap_by_delta(reference_idx[~is_trial])
-
-        return positive_idx
-
-    def _sample_trial_delta_resampled(self, reference_idx: torch.Tensor) -> torch.Tensor:
-        """``trial_delta``: re-sampled delta-style trial + uniform in trial.
-
-        Each call independently samples a target trial via delta-style query
-        (CEBRA ``DeltaNormalDistribution`` principle at trial level), then
-        draws a timepoint uniformly from the entire target trial.
-
-        Trial anchors:  per-step delta-style trial selection +
-                        uniform sampling within the selected trial.
-        Gap anchors:    delta-style content sampling (timepoint level).
-        """
-        ref_trial_ids = self.timepoint_to_trial[reference_idx]
-        is_trial = ref_trial_ids >= 0
-        positive_idx = torch.empty_like(reference_idx)
-
-        if is_trial.any():
-            ref_trial = ref_trial_ids[is_trial]
-            target_trial = self._delta_trial_select(ref_trial)
-
-            t_start = self.trial_starts[target_trial]
-            t_len = self.trial_lengths[target_trial]
-            rand_off = (
-                torch.rand(ref_trial.size(0), device=self.device, generator=self.generator)
-                * t_len.float()
-            ).long()
-            positive_idx[is_trial] = t_start + rand_off
-
-        if (~is_trial).any():
-            positive_idx[~is_trial] = self._gap_by_delta(reference_idx[~is_trial])
-
-        return positive_idx
-
-    def _sample_trial_time_delta(self, reference_idx: torch.Tensor) -> torch.Tensor:
-        """``trialTime_delta``: re-sampled delta-style trial + ±offset window.
-
-        Uses the identical trial-selection mechanism as ``trial_delta``
-        (per-step isotropic Gaussian query on trial-mean embeddings), but
-        constrains the drawn timepoint to ±time_offset of the anchor's
-        relative position inside the target trial.
-
-        This gives the same trial diversity as ``trial_delta`` while
-        additionally enforcing temporal proximity within the target trial.
-        Pool-based argmin was discarded: for stimulus data where embeddings
-        are constant within a trial (Δstim ≈ 0), argmin over timepoints
-        always selects the same trial, yielding near-zero diversity.
-
-        Trial anchors:  per-step delta-style trial selection
-                        (``_delta_trial_select``); draw uniformly within
-                        ``[ref_rel ± time_offset]`` of the target trial.
-        Gap anchors:    delta-style content sampling (timepoint level).
-        """
-        ref_trial_ids = self.timepoint_to_trial[reference_idx]
-        is_trial = ref_trial_ids >= 0
-        positive_idx = torch.empty_like(reference_idx)
-
-        if is_trial.any():
-            ref_t = reference_idx[is_trial]
-            ref_trial = ref_trial_ids[is_trial]
-            ref_rel = ref_t - self.trial_starts[ref_trial]
-
-            target_trial = self._delta_trial_select(ref_trial)
-
-            t_start = self.trial_starts[target_trial]
-            t_len = self.trial_lengths[target_trial]
-            t_rel = torch.clamp(ref_rel, max=t_len - 1)
-            low = torch.clamp(t_rel - self.time_offset, min=0)
-            high = torch.clamp(t_rel + self.time_offset + 1, max=t_len)
-            positive_idx[is_trial] = t_start + low + self._randint_range(low, high)
-
-        if (~is_trial).any():
-            positive_idx[~is_trial] = self._gap_by_delta(reference_idx[~is_trial])
-
-        return positive_idx
-
-    def _sample_trial_time_trial_delta(self, reference_idx: torch.Tensor) -> torch.Tensor:
-        """``trialTime_trialDelta``: locked time_delta-style trial + ±offset window.
-
-        Trial anchors:  use pre-computed ``_locked_target_trials`` mapping
-                        (time_delta-style, fixed at init); sample within
-                        ±time_offset of the reference's relative position in
-                        the locked target trial.
-        Gap anchors:    time_delta-style content sampling (timepoint level).
-        """
-        ref_trial_ids = self.timepoint_to_trial[reference_idx]
-        is_trial = ref_trial_ids >= 0
-        positive_idx = torch.empty_like(reference_idx)
-
-        if is_trial.any():
-            ref_t = reference_idx[is_trial]
-            ref_trial = ref_trial_ids[is_trial]
-            ref_rel = ref_t - self.trial_starts[ref_trial]
-
-            target_trial = self._locked_target_trials[ref_trial]
-
-            t_start = self.trial_starts[target_trial]
-            t_len = self.trial_lengths[target_trial]
-            t_rel = torch.clamp(ref_rel, max=t_len - 1)
-            low = torch.clamp(t_rel - self.time_offset, min=0)
-            high = torch.clamp(t_rel + self.time_offset + 1, max=t_len)
-            positive_idx[is_trial] = t_start + low + self._randint_range(low, high)
-
-        if (~is_trial).any():
-            positive_idx[~is_trial] = self._gap_by_timedelt(reference_idx[~is_trial])
-
-        return positive_idx
-
-    # ------------------------------------------------------------------
-    # Private helpers: trial selection
-    # ------------------------------------------------------------------
-
-    def _compute_locked_trials(self) -> torch.Tensor:
-        """Pre-compute a fixed ``ref_trial → target_trial`` mapping at init.
-
-        Uses the appropriate query mechanism for the conditional:
-
-        * ``trialDelta``: delta-style (one Gaussian noise sample per trial).
-        * ``trialTime_trialDelta``: time_delta-style (one stim-diff sample per trial).
-        """
-        trial_ids = torch.arange(self.num_trials, device=self.device)
-        if self.conditional in _NEEDS_DELTA_TRIAL:
-            return self._delta_trial_select(trial_ids)
+        if anchor_class is not None and self._disc_mode == _DISC_MODE_PER_TP_3D:
+            class_idx = self._class_value_to_idx(anchor_class)
+            # avoid (B, ntrial, nd) — loop over unique classes, cdist each slice
+            dists = torch.full((B, self.ntrial), float("inf"), device=query.device)
+            for c_idx in class_idx.unique():
+                mask_b = class_idx == c_idx
+                emb_c = self._trial_emb_per_class[c_idx]  # (ntrial, nd)
+                dists[mask_b] = torch.cdist(query[mask_b], emb_c)  # (B_c, ntrial)
+        elif anchor_class is not None and self._disc_mode == _DISC_MODE_PER_TRIAL:
+            dists = torch.cdist(query, self.trial_emb)  # (B, ntrial)
+            class_row = self._trial_class.unsqueeze(0)  # (1, ntrial)
+            anchor_col = anchor_class.unsqueeze(1)  # (B, 1)
+            dists = dists.masked_fill(class_row != anchor_col, float("inf"))
         else:
-            return self._timedelt_trial_select(trial_ids)
+            dists = torch.cdist(query, self.trial_emb)  # (B, ntrial)
+
+        # Robust stochastic tiebreak (per-row reference magnitude + abs floor)
+        finite = torch.isfinite(dists)
+        finite_safe = dists.masked_fill(~finite, 0.0)
+        finite_count = finite.sum(dim=1).clamp(min=1).float()
+        row_ref = (finite_safe.abs().sum(dim=1) / finite_count).unsqueeze(1)  # (B, 1)
+        scale = torch.clamp(row_ref * 1e-6, min=1e-6)
+        gumbel = -torch.empty_like(dists).exponential_(generator=self.generator).log()
+        dists = dists + scale * gumbel
+        target_trial = dists.argmin(dim=1)  # (B,)
+
+        if anchor_class is not None:
+            return self._trial_sample_classaware(target_trial, anchor_class)
+        rand_off = (torch.rand(B, device=self.device, generator=self.generator) * self.ntime).long()
+        return target_trial * self.ntime + rand_off
+
+    def _search_given_query_time_delta(
+        self,
+        query: torch.Tensor,
+        anchor_class: Optional[torch.Tensor],
+        B: int,
+    ) -> torch.Tensor:
+        """Joint argmin over all (trial, t) in y space — time window dropped.
+
+        Chunked over the batch axis to bound peak VRAM when
+        ``ntrial * ntime`` is large.
+        """
+        self.ntrial * self.ntime
+        results: list[torch.Tensor] = []
+        for start in range(0, B, _ARGMIN_CHUNK):
+            end = min(start + _ARGMIN_CHUNK, B)
+            q = query[start:end]  # (C, nd)
+            # ||q - y||² = ||q||² + ||y||² - 2 q·y, batched via bmm
+            q_norm2 = (q**2).sum(-1, keepdim=True)  # (C, 1)
+            y_norm2 = self._y_norm2.unsqueeze(0)  # (1, N)
+            cross = q @ self._y_flat.T  # (C, N)
+            dists = q_norm2 + y_norm2 - 2 * cross  # (C, N)
+            if anchor_class is not None:
+                cand_disc = self._y_discrete.unsqueeze(0)  # (1, N)
+                ac = anchor_class[start:end].unsqueeze(1)  # (C, 1)
+                dists = dists.masked_fill(cand_disc != ac, float("inf"))
+            # Stochastic tiebreak — per-row scale with abs floor
+            finite = torch.isfinite(dists)
+            finite_safe = dists.masked_fill(~finite, 0.0)
+            finite_count = finite.sum(dim=1).clamp(min=1).float()
+            row_ref = (finite_safe.abs().sum(dim=1) / finite_count).unsqueeze(1)
+            scale = torch.clamp(row_ref * 1e-6, min=1e-6)
+            gumbel = -torch.empty_like(dists).exponential_(generator=self.generator).log()
+            dists = dists + scale * gumbel
+            results.append(dists.argmin(dim=1))
+        return torch.cat(results)
+
+    # ------------------------------------------------------------------
+    # Per-conditional sampling (single-session)
+    # ------------------------------------------------------------------
+
+    def _sample_time(self, ref: torch.Tensor) -> torch.Tensor:
+        ref_trial = ref // self.ntime
+        ref_rel = ref % self.ntime
+        target_trial = self._select_trial_uniform(ref_trial)
+        if hasattr(self, "_y_discrete"):
+            anchor_class = self._y_discrete[ref]
+            return self._window_sample_classaware(target_trial, ref_rel, anchor_class)
+        return self._window_sample(target_trial, ref_rel)
+
+    def _sample_delta(self, ref: torch.Tensor) -> torch.Tensor:
+        ref_trial = ref // self.ntime
+
+        if hasattr(self, "_y_discrete"):
+            anchor_class = self._y_discrete[ref]
+            if self._disc_mode == _DISC_MODE_PER_TP_2D:
+                # Fallback: class-agnostic trial selection (warned at init)
+                if self.sample_fix_trial:
+                    target_trial = self._locked_target_trials[ref_trial]
+                else:
+                    target_trial = self._delta_trial_select(ref_trial)
+            else:
+                # Class-conditional path (Mode A or Mode B)
+                if self.sample_fix_trial:
+                    class_idx = self._class_value_to_idx(anchor_class)
+                    target_trial = self._locked_target_trials_per_class[class_idx, ref_trial]
+                else:
+                    target_trial = self._class_conditional_trial_select(ref_trial, anchor_class)
+            return self._trial_sample_classaware(target_trial, anchor_class)
+
+        # No discrete: original class-agnostic path
+        if self.sample_fix_trial:
+            target_trial = self._locked_target_trials[ref_trial]
+        else:
+            target_trial = self._delta_trial_select(ref_trial)
+        rand_off = (
+            torch.rand(ref.size(0), device=self.device, generator=self.generator) * self.ntime
+        ).long()
+        return target_trial * self.ntime + rand_off
+
+    def _sample_time_delta(self, ref: torch.Tensor) -> torch.Tensor:
+        ref_trial = ref // self.ntime
+        ref_rel = ref % self.ntime
+        if self.sample_fix_trial:
+            target_trial = self._locked_target_trials[ref_trial]
+            query = self._y_flat[ref]  # (B, nd)
+            anchor_class = self._y_discrete[ref] if hasattr(self, "_y_discrete") else None
+            return self._window_argmin(target_trial, ref_rel, query, anchor_class=anchor_class)
+        else:
+            return self._joint_argmin(ref, ref_trial, ref_rel)
+
+    # ------------------------------------------------------------------
+    # Trial selection helpers
+    # ------------------------------------------------------------------
 
     def _delta_trial_select(self, ref_trial_ids: torch.Tensor) -> torch.Tensor:
-        """Select target trial via CEBRA delta principle.
+        """Select target trial via Gaussian-noise delta query on trial_emb.
 
-        Follows :py:class:`cebra.distributions.continuous.DeltaNormalDistribution`
-        transposed to trial level::
-
-            query = trial_mean[ref_trial] + N(0, δ²I)
-            target = argmin_j  dist(query, trial_mean[j])
-
-        Both own-trial exclusion and discrete-class filtering are applied.
-
-        Args:
-            ref_trial_ids: Trial IDs of reference timepoints, shape ``(B,)``.
-
-        Returns:
-            Target trial IDs, shape ``(B,)``.
+        For ``sample_exclude_intrial=True`` (default), uses argmin after self
+        masking — closest cross-trial neighbour wins. For ``sample_exclude_intrial=False``,
+        uses Gumbel-max stochastic sampling (softmax(-dists/T) with T=delta)
+        instead of argmin. The argmin would otherwise return self with very
+        high probability in high-dim because Gaussian noise of std ``delta``
+        is mostly orthogonal to inter-trial offsets and cannot escape
+        self-similarity, leading to a degenerate positive sampling that
+        collapses the embedding. Stochastic selection biases toward similar
+        trials but does not pin to self, providing a meaningful contrastive
+        signal.
         """
-        B, T = ref_trial_ids.size(0), self.num_trials
-        mean = self.trial_embeddings[ref_trial_ids]  # (B, d)
+        B = ref_trial_ids.size(0)
+        mean = self.trial_emb[ref_trial_ids]  # (B, nd)
         noise = torch.empty_like(mean).normal_(generator=self.generator)
-        if self.delta is not None:
-            noise = noise * self.delta / (mean.size(-1) ** 0.5)
-        query = mean + noise  # (B, d)
-
-        dists = torch.cdist(query, self.trial_embeddings)  # (B, T)
-
-        # Exclude own trial
-        self_mask = torch.zeros(B, T, dtype=torch.bool, device=self.device)
-        self_mask.scatter_(1, ref_trial_ids.unsqueeze(1), True)
-        dists = dists.masked_fill(self_mask, float("inf"))
-
-        # Discrete class filter
-        if self.discrete is not None:
-            same_class = self._trial_same_class[ref_trial_ids]
-            dists = dists.masked_fill(~same_class, float("inf"))
-
-        return dists.argmin(dim=1)  # (B,)
-
-    def _timedelt_trial_select(self, ref_trial_ids: torch.Tensor) -> torch.Tensor:
-        """Select target trial via CEBRA time_delta principle.
-
-        Follows :py:class:`cebra.distributions.continuous.TimedeltaDistribution`
-        transposed to trial level::
-
-            Δstim[k] = continuous[k] - continuous[k - time_offset]
-            query    = trial_mean[ref_trial] + Δstim[random_k]
-            target   = argmin_j  dist(query, trial_mean[j])
-
-        Both own-trial exclusion and discrete-class filtering are applied.
-
-        Args:
-            ref_trial_ids: Trial IDs of reference timepoints, shape ``(B,)``.
-
-        Returns:
-            Target trial IDs, shape ``(B,)``.
-        """
-        B, T = ref_trial_ids.size(0), self.num_trials
-        anchor_stim = self.trial_embeddings[ref_trial_ids]  # (B, d)
-        diff_idx = self.randint(len(self._time_difference), (B,))
-        query = anchor_stim + self._time_difference[diff_idx]  # (B, d)
-
-        dists = torch.cdist(query, self.trial_embeddings)  # (B, T)
-
-        # Exclude own trial
-        self_mask = torch.zeros(B, T, dtype=torch.bool, device=self.device)
-        self_mask.scatter_(1, ref_trial_ids.unsqueeze(1), True)
-        dists = dists.masked_fill(self_mask, float("inf"))
-
-        # Discrete class filter
-        if self.discrete is not None:
-            same_class = self._trial_same_class[ref_trial_ids]
-            dists = dists.masked_fill(~same_class, float("inf"))
-
-        return dists.argmin(dim=1)  # (B,)
-
-    def _uniform_other_trial(self, ref_trial_ids: torch.Tensor) -> torch.Tensor:
-        """Sample a target trial uniformly at random (≠ own, same class).
-
-        Uses the Gumbel-max trick: log-weight ``0`` for valid trials,
-        ``-inf`` for own trial and (optionally) different-class trials.
-
-        Args:
-            ref_trial_ids: Trial IDs of reference timepoints, shape ``(B,)``.
-
-        Returns:
-            Target trial IDs, shape ``(B,)``.
-        """
-        B, T = ref_trial_ids.size(0), self.num_trials
-        log_w = torch.zeros(B, T, device=self.device)
-
-        log_w.scatter_(
-            1, ref_trial_ids.unsqueeze(1), torch.full((B, 1), float("-inf"), device=self.device)
-        )
-
-        if self.discrete is not None:
-            same_class = self._trial_same_class[ref_trial_ids]
-            log_w = log_w.masked_fill(~same_class, float("-inf"))
-
+        noise = noise * self.delta / (mean.size(-1) ** 0.5)
+        query = mean + noise  # (B, nd)
+        dists = torch.cdist(query, self.trial_emb)  # (B, ntrial)
+        if self.sample_exclude_intrial:
+            mask = torch.zeros(B, self.ntrial, dtype=torch.bool, device=self.device)
+            mask.scatter_(1, ref_trial_ids.unsqueeze(1), True)
+            dists = dists.masked_fill(mask, float("inf"))
+            return dists.argmin(dim=1)
+        # excl=False: stochastic Gumbel-max sampling biased toward closer trials
+        T = max(float(self.delta), 1e-6)
+        log_w = -dists / T  # (B, ntrial)
         gumbel = -torch.empty_like(log_w).exponential_(generator=self.generator).log()
         return (log_w + gumbel).argmax(dim=1)
 
     # ------------------------------------------------------------------
-    # Private helpers: gap anchor strategies
+    # Class-conditional trial selection (used by _sample_delta when y_discrete)
     # ------------------------------------------------------------------
 
-    def _gap_by_time(self, ref_idx: torch.Tensor) -> torch.Tensor:
-        """Global ±time_offset window sampling for gap anchors (``trialTime``).
+    def _build_class_conditional_state(
+        self,
+        yd: torch.Tensor,
+        conditional: str,
+        device: str,
+    ) -> str:
+        """Detect discrete mode and build supporting tensors for delta path.
 
-        Without a discrete index: uniform over the full ±time_offset window.
-        With a discrete index: sample uniformly from **all** same-class
-        timepoints globally (the ±time_offset window is dropped).  This
-        forces every gap timepoint to be treated as an exchangeable member
-        of its discrete class, so the encoder clusters the entire gap period
-        into one region rather than preserving intra-gap temporal structure.
+        Returns one of ``_DISC_MODE_*``. Only delta uses the resulting state;
+        time / time_delta paths already enforce same-class via gumbel masking.
         """
-        N = len(self.continuous) if self.continuous is not None else int(self.trial_ends.max())
+        # Detect per-trial vs per-timepoint
+        yd_2d = yd.view(self.ntrial, self.ntime)
+        is_per_trial = bool((yd_2d == yd_2d[:, :1]).all().item())
 
-        if self.discrete is None:
-            low = torch.clamp(ref_idx - self.time_offset, min=0)
-            high = torch.clamp(ref_idx + self.time_offset + 1, max=N)
-            return low + self._randint_range(low, high)
+        if conditional != "delta":
+            # Other conditionals: discrete is enforced inside positive-sampling
+            # helpers (_window_sample_classaware, _trial_sample_classaware,
+            # _joint_argmin), no extra trial-level state required.
+            return _DISC_MODE_PER_TRIAL if is_per_trial else _DISC_MODE_PER_TP_3D
 
-        # Discrete present: global class-uniform sampling (Gumbel-max trick).
-        B = ref_idx.size(0)
-        all_idx = torch.arange(N, device=self.device)  # (N,)
+        if is_per_trial:
+            # Mode A: each trial belongs to a single class
+            self._trial_class = yd_2d[:, 0].clone()  # (ntrial,) class value per trial
+            self._trial_class_idx = torch.searchsorted(
+                self._classes_sorted, self._trial_class
+            )  # (ntrial,) idx into classes
+            return _DISC_MODE_PER_TRIAL
 
-        ref_class = self.discrete[ref_idx]  # (B,)
-        same_class = self.discrete.unsqueeze(0) == ref_class.unsqueeze(1)  # (B, N)
-        not_self = all_idx.unsqueeze(0) != ref_idx.unsqueeze(1)  # (B, N)
-        valid = same_class & not_self  # (B, N)
+        # Per-timepoint discrete
+        if self._y_delta_3d is not None:
+            # Mode B: per-class trial embedding aggregated over class-c timepoints
+            y_3d = self._y_delta_3d  # (ntrial, ntime, nd)
+            nd = y_3d.shape[-1]
+            trial_emb_pc = torch.zeros(self._n_classes, self.ntrial, nd, device=device)
+            for ci in range(self._n_classes):
+                c_val = self._classes_sorted[ci]
+                mask = (yd_2d == c_val).float()  # (ntrial, ntime)
+                counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # (ntrial, 1)
+                weighted = y_3d * mask.unsqueeze(-1)  # (ntrial, ntime, nd)
+                trial_emb_pc[ci] = weighted.sum(dim=1) / counts  # (ntrial, nd)
+                # Trials with zero class-c timepoints fall back to overall mean
+                missing = mask.sum(dim=1) == 0  # (ntrial,)
+                if missing.any():
+                    trial_emb_pc[ci, missing] = y_3d[missing].mean(dim=1)
+            self._trial_emb_per_class = trial_emb_pc  # (n_classes, ntrial, nd)
+            return _DISC_MODE_PER_TP_3D
 
-        log_w = torch.where(
-            valid,
-            torch.zeros(B, N, device=self.device),
-            torch.full((B, N), float("-inf"), device=self.device),
+        # Mode C: per-timepoint discrete with only 2-D y -- cannot decompose
+        warnings.warn(
+            "delta with per-timepoint y_discrete (varying within trial) and 2-D "
+            "y_continuous (per-trial) cannot compute class-conditional trial "
+            "embeddings. Trial selection will remain class-agnostic; the same-"
+            "class constraint still applies to positive sampling. For full "
+            "class-conditional trial selection, pass 3-D y_continuous of shape "
+            "(ntrial, ntime, nd).",
+            UserWarning,
+            stacklevel=3,
         )
-        gumbel = -torch.empty(B, N, device=self.device).exponential_(generator=self.generator).log()
-        return (log_w + gumbel).argmax(dim=1)  # (B,)
+        return _DISC_MODE_PER_TP_2D
 
-    def _gap_by_delta(self, ref_idx: torch.Tensor) -> torch.Tensor:
-        """Gap anchor sampling: CEBRA delta principle at timepoint level.
+    def _class_value_to_idx(self, class_values: torch.Tensor) -> torch.Tensor:
+        """Map class-value tensor to indices into ``_classes_sorted``."""
+        return torch.searchsorted(self._classes_sorted, class_values)
 
-        Constructs ``query = stim[anchor] + N(0, δ²I)`` (following
-        :py:class:`cebra.distributions.continuous.DeltaNormalDistribution`)
-        and returns the nearest same-class timepoint via argmin.
+    def _class_conditional_trial_select(
+        self,
+        ref_trial_ids: torch.Tensor,
+        anchor_class: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select target trial via class-conditional Gaussian-similarity query.
+
+        Behavior depends on ``self._disc_mode`` (set in ``__init__``):
+
+        * ``per_trial`` — restrict candidates to trials whose (single) class
+          equals the anchor's class; argmin cdist over ``trial_emb``.
+        * ``per_tp_3d`` — use ``_trial_emb_per_class[anchor_class]`` as the
+          query basis; argmin cdist among all trials.
+        * ``per_tp_2d_fallback`` — delegate to class-agnostic
+          ``_delta_trial_select`` (warning was emitted at init).
+
+        A small Gumbel noise is added to dists before argmin to stochastically
+        break ties (e.g., when all trials share the same class-c embedding,
+        as happens for pre-stim gray-screen labels).
         """
-        mean = self.continuous[ref_idx]  # (n, d)
-        noise = torch.empty_like(mean).normal_(generator=self.generator)
-        if self.delta is not None:
+        if self._disc_mode == _DISC_MODE_PER_TP_2D:
+            return self._delta_trial_select(ref_trial_ids)
+
+        B = ref_trial_ids.size(0)
+
+        if self._disc_mode == _DISC_MODE_PER_TRIAL:
+            emb = self.trial_emb  # (ntrial, nd)
+            mean = emb[ref_trial_ids]  # (B, nd)
+            noise = torch.empty_like(mean).normal_(generator=self.generator)
             noise = noise * self.delta / (mean.size(-1) ** 0.5)
-        query = mean + noise
-        return self._gap_query_argmin(ref_idx, query)
+            query = mean + noise  # (B, nd)
+            dists = torch.cdist(query, emb)  # (B, ntrial)
+            # Restrict candidates to trials whose class matches anchor's
+            anchor_col = anchor_class.unsqueeze(1)  # (B, 1)
+            class_row = self._trial_class.unsqueeze(0)  # (1, ntrial)
+            class_mask = class_row == anchor_col  # (B, ntrial)
+            dists = dists.masked_fill(~class_mask, float("inf"))
 
-    def _gap_by_timedelt(self, ref_idx: torch.Tensor) -> torch.Tensor:
-        """Gap anchor sampling: CEBRA time_delta principle at timepoint level.
+        else:  # _DISC_MODE_PER_TP_3D
+            # Avoid materialising (B, ntrial, nd) by looping over the small
+            # number of unique classes present in the batch.
+            class_idx = self._class_value_to_idx(anchor_class)  # (B,)
+            dists = torch.full((B, self.ntrial), float("inf"), device=self.device)
+            for c_idx in class_idx.unique():
+                mask_b = class_idx == c_idx  # (B,) bool
+                emb_c = self._trial_emb_per_class[c_idx]  # (ntrial, nd)
+                mean_c = emb_c[ref_trial_ids[mask_b]]  # (B_c, nd)
+                noise = torch.empty_like(mean_c).normal_(generator=self.generator)
+                noise = noise * self.delta / (mean_c.size(-1) ** 0.5)
+                query_c = mean_c + noise  # (B_c, nd)
+                dists[mask_b] = torch.cdist(query_c, emb_c)  # (B_c, ntrial)
 
-        Constructs ``query = stim[anchor] + Δstim[random_k]`` (following
-        :py:class:`cebra.distributions.continuous.TimedeltaDistribution`)
-        and returns the nearest same-class timepoint via argmin.
+        if self.sample_exclude_intrial:
+            self_mask = torch.zeros(B, self.ntrial, dtype=torch.bool, device=self.device)
+            self_mask.scatter_(1, ref_trial_ids.unsqueeze(1), True)
+            dists_excl = dists.masked_fill(self_mask, float("inf"))
+            # Fallback: if all candidates masked (e.g., anchor's class has only 1
+            # trial), drop self-exclusion so we still return a same-class target
+            # rather than degenerating to argmin-of-inf (which silently returns
+            # index 0, possibly the wrong class).
+            no_valid = ~torch.isfinite(dists_excl).any(dim=1)
+            if no_valid.any():
+                dists = torch.where(no_valid.unsqueeze(1), dists, dists_excl)
+            else:
+                dists = dists_excl
+
+        # Stochastic tiebreak: tiny gumbel perturbation, scaled to be robust
+        # across batch sizes. We use a *per-anchor* scale derived from the
+        # finite dists in each row, with an absolute floor so that even a
+        # single-anchor batch with fully tied dists still randomizes.
+        finite = torch.isfinite(dists)  # (B, ntrial)
+        # Per-row reference magnitude (mean of finite dists in that row).
+        # Rows with no finite dists fall back to absolute floor.
+        finite_safe = dists.masked_fill(~finite, 0.0)
+        finite_count = finite.sum(dim=1).clamp(min=1).float()
+        row_ref = (finite_safe.abs().sum(dim=1) / finite_count).unsqueeze(1)  # (B, 1)
+        scale = torch.clamp(row_ref * 1e-6, min=1e-6)  # (B, 1)
+        gumbel = -torch.empty_like(dists).exponential_(generator=self.generator).log()
+        # Gumbel is positive; finite + small_positive stays finite, inf stays inf
+        dists = dists + scale * gumbel
+        return dists.argmin(dim=1)
+
+    def _select_trial_uniform(self, ref_trial_ids: torch.Tensor) -> torch.Tensor:
+        """Sample a target trial uniformly at random, optionally excluding own trial."""
+        B = ref_trial_ids.size(0)
+        if self.sample_exclude_intrial:
+            log_w = torch.zeros(B, self.ntrial, device=self.device)
+            log_w.scatter_(
+                1,
+                ref_trial_ids.unsqueeze(1),
+                torch.full((B, 1), float("-inf"), device=self.device),
+            )
+            gumbel = -torch.empty_like(log_w).exponential_(generator=self.generator).log()
+            return (log_w + gumbel).argmax(dim=1)
+        else:
+            return self.randint(0, self.ntrial, (B,))
+
+    # ------------------------------------------------------------------
+    # Within-trial window sampling
+    # ------------------------------------------------------------------
+
+    def _window_sample(self, target_trial: torch.Tensor, ref_rel: torch.Tensor) -> torch.Tensor:
+        """Sample uniformly within ±time_offsets of ref_rel inside target_trial."""
+        t_rel = torch.clamp(ref_rel, max=self.ntime - 1)
+        low = torch.clamp(t_rel - self.time_offsets, min=0)
+        high = torch.clamp(t_rel + self.time_offsets + 1, max=self.ntime)
+        offset = self._randint_range(low, high)
+        return target_trial * self.ntime + low + offset
+
+    def _window_sample_classaware(
+        self,
+        target_trial: torch.Tensor,
+        ref_rel: torch.Tensor,
+        anchor_class: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gumbel-max over ±time_offsets window positions matching anchor_class.
+
+        Falls back to unconstrained :py:meth:`_window_sample` for anchors where
+        no same-class candidate exists in the target trial's window.
         """
-        mean = self.continuous[ref_idx]  # (n, d)
-        diff_idx = self.randint(len(self._time_difference), (ref_idx.size(0),))
-        query = mean + self._time_difference[diff_idx]
-        return self._gap_query_argmin(ref_idx, query)
+        B = target_trial.size(0)
+        W = 2 * self.time_offsets + 1
+        dt_vec = torch.arange(-self.time_offsets, self.time_offsets + 1, device=self.device)
 
-    def _gap_query_argmin(self, ref_idx: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
-        """Shared argmin for gap anchor queries with masking.
+        # t positions: (B, W)
+        t_pos = (ref_rel.unsqueeze(1) + dt_vec.unsqueeze(0)).clamp(0, self.ntime - 1)
+        flat_idx = target_trial.unsqueeze(1) * self.ntime + t_pos  # (B, W)
+        disc_match = self._y_discrete[flat_idx] == anchor_class.unsqueeze(1)  # (B, W)
 
-        Computes ``argmin_i dist(query, continuous[i])`` over all same-class
-        timepoints, excluding self.
+        gumbel = -torch.empty(B, W, device=self.device).exponential_(generator=self.generator).log()
+        gumbel = gumbel.masked_fill(~disc_match, float("-inf"))
+        best_w = gumbel.argmax(dim=1)  # (B,)
+        best_t = t_pos[torch.arange(B, device=self.device), best_w]  # (B,)
+
+        result = target_trial * self.ntime + best_t
+        no_match = ~disc_match.any(dim=1)
+        if no_match.any():
+            result = result.clone()
+            result[no_match] = self._window_sample(target_trial[no_match], ref_rel[no_match])
+        return result
+
+    def _trial_sample_classaware(
+        self,
+        target_trial: torch.Tensor,
+        anchor_class: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gumbel-max over all timepoints in target_trial matching anchor_class.
+
+        Falls back to uniform random within trial for anchors where no same-class
+        timepoint exists in the target trial.
+        """
+        B = target_trial.size(0)
+        all_t = (
+            torch.arange(self.ntime, device=self.device).unsqueeze(0).expand(B, -1)
+        )  # (B, ntime)
+        flat_idx = target_trial.unsqueeze(1) * self.ntime + all_t  # (B, ntime)
+        disc_match = self._y_discrete[flat_idx] == anchor_class.unsqueeze(1)  # (B, ntime)
+
+        gumbel = (
+            -torch.empty(B, self.ntime, device=self.device)
+            .exponential_(generator=self.generator)
+            .log()
+        )
+        gumbel = gumbel.masked_fill(~disc_match, float("-inf"))
+        best_t = gumbel.argmax(dim=1)  # (B,)
+
+        result = target_trial * self.ntime + best_t
+        no_match = ~disc_match.any(dim=1)
+        if no_match.any():
+            rand_off = (
+                torch.rand(no_match.sum(), device=self.device, generator=self.generator)
+                * self.ntime
+            ).long()
+            result = result.clone()
+            result[no_match] = target_trial[no_match] * self.ntime + rand_off
+        return result
+
+    def _window_argmin(
+        self,
+        target_trial: torch.Tensor,
+        ref_rel: torch.Tensor,
+        query: torch.Tensor,
+        anchor_class: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Within a fixed target trial, return argmin-y timepoint in ±time_offsets window.
 
         Args:
-            ref_idx: Gap anchor indices, shape ``(n,)``.
-            query:   Query embeddings, shape ``(n, d)``.
+            target_trial: (B,) trial indices for positive targets.
+            ref_rel:      (B,) anchor relative positions (within-trial).
+            query:        (B, nd) query embeddings (no noise added here).
+            anchor_class: (B,) optional discrete class labels for same-class constraint.
 
         Returns:
-            Positive timepoint indices, shape ``(n,)``.
+            (B,) flat positive indices.
         """
-        dist = torch.cdist(query, self.continuous)  # (n, N)
+        B = target_trial.size(0)
+        best_dist = torch.full((B,), float("inf"), device=self.device)
+        best_t = ref_rel.clamp(0, self.ntime - 1)
 
-        # Exclude self
-        dist.scatter_(
-            1,
-            ref_idx.unsqueeze(1),
-            torch.full((ref_idx.size(0), 1), float("inf"), device=self.device),
+        for dt in range(-self.time_offsets, self.time_offsets + 1):
+            t_pos = (ref_rel + dt).clamp(0, self.ntime - 1)
+            flat_idx = target_trial * self.ntime + t_pos
+            y_at_t = self._y_flat[flat_idx]  # (B, nd)
+            dist = (y_at_t - query).pow(2).sum(-1)  # (B,)
+            if anchor_class is not None:
+                disc_mismatch = self._y_discrete[flat_idx] != anchor_class
+                dist = dist.masked_fill(disc_mismatch, float("inf"))
+            update = dist < best_dist
+            best_dist = torch.where(update, dist, best_dist)
+            best_t = torch.where(update, t_pos, best_t)
+
+        return target_trial * self.ntime + best_t
+
+    # ------------------------------------------------------------------
+    # Joint argmin for time_delta (fix_trial=False)
+    # ------------------------------------------------------------------
+
+    def _joint_argmin(
+        self,
+        ref: torch.Tensor,
+        ref_trial: torch.Tensor,
+        ref_rel: torch.Tensor,
+    ) -> torch.Tensor:
+        """Argmin over all cross-trial candidates within the ±time_offsets window.
+
+        Candidate pool for anchor (trial_i, rel_i)::
+
+            {(trial_j, t) : trial_j ≠ trial_i, |t − rel_i| ≤ time_offsets}
+
+        All W window positions are gathered at once and distances computed via
+        a single batched matrix multiply, avoiding the Python for-loop over W.
+        Processed in chunks of ``_ARGMIN_CHUNK`` anchors to bound peak VRAM
+        (peak tensor: ``(chunk, ntrial*W, nd)``).
+
+        Returns:
+            (B,) flat positive indices.
+        """
+        B = ref.size(0)
+        nd = self._y_flat.shape[1]
+        W = 2 * self.time_offsets + 1
+        all_trials = torch.arange(self.ntrial, device=self.device)  # (ntrial,)
+        dt_vec = torch.arange(
+            -self.time_offsets,
+            self.time_offsets + 1,
+            device=self.device,  # (W,)
         )
 
-        # Discrete class filter
-        if self.discrete is not None:
-            ref_class = self.discrete[ref_idx]  # (n,)
-            same = torch.eq(
-                self.discrete.unsqueeze(0),  # (1, N)
-                ref_class.unsqueeze(1),  # (n, 1)
-            )
-            dist = dist.masked_fill(~same, float("inf"))
+        results: list[torch.Tensor] = []
+        for start in range(0, B, _ARGMIN_CHUNK):
+            end = min(start + _ARGMIN_CHUNK, B)
+            c_ref = ref[start:end]
+            c_trial = ref_trial[start:end]
+            c_rel = ref_rel[start:end]
+            C = c_ref.size(0)
 
-        return dist.argmin(dim=1)
+            # Query: y at anchor + Gaussian noise — (C, nd)
+            noise = torch.empty(C, nd, device=self.device).normal_(generator=self.generator)
+            noise *= self.delta / (nd**0.5)
+            query = self._y_flat[c_ref] + noise
 
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
+            # Window t positions for every (anchor, w): (C, W)
+            t_cands = (c_rel.unsqueeze(1) + dt_vec.unsqueeze(0)).clamp(0, self.ntime - 1)
+
+            # Flat indices for all (anchor, trial, w): (C, ntrial*W)
+            flat_idx = (all_trials.view(1, -1, 1) * self.ntime + t_cands.view(C, 1, W)).view(C, -1)
+
+            # Gather y and compute distances via ||q-y||² = ||q||² + ||y||² - 2q·y
+            y_cands = self._y_flat[flat_idx]  # (C, ntrial*W, nd)
+            q_norm2 = (query**2).sum(-1, keepdim=True)  # (C, 1)
+            y_norm2 = self._y_norm2[flat_idx]  # (C, ntrial*W)
+            cross = torch.bmm(y_cands, query.unsqueeze(-1)).squeeze(-1)  # (C, ntrial*W)
+            dist_flat = q_norm2 + y_norm2 - 2 * cross  # (C, ntrial*W)
+
+            # Same-class constraint: mask candidates whose discrete label ≠ anchor's
+            if hasattr(self, "_y_discrete"):
+                anchor_disc = self._y_discrete[c_ref]  # (C,)
+                cand_disc = self._y_discrete[flat_idx]  # (C, ntrial*W)
+                disc_mismatch = cand_disc != anchor_disc.unsqueeze(1)
+                dist_flat = dist_flat.masked_fill(disc_mismatch, float("inf"))
+
+            # Min over W for each (anchor, trial): (C, ntrial)
+            best_dist, best_w = dist_flat.view(C, self.ntrial, W).min(dim=2)
+
+            # Recover best t: best_w indexes into t_cands's W axis
+            c_idx = torch.arange(C, device=self.device).unsqueeze(1).expand_as(best_w)
+            best_t = t_cands[c_idx, best_w]  # (C, ntrial)
+
+            if self.sample_exclude_intrial:
+                best_dist.scatter_(1, c_trial.unsqueeze(1), float("inf"))
+
+            target_trial = best_dist.argmin(dim=1)  # (C,)
+            target_t = best_t[torch.arange(C, device=self.device), target_trial]
+            results.append(target_trial * self.ntime + target_t)
+
+        return torch.cat(results)
 
     def _randint_range(self, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
-        """Per-element uniform integer in ``[0, high - low)``.
-
-        Args:
-            low:  Lower bound tensor, shape ``(B,)``.
-            high: Upper bound tensor, shape ``(B,)``.
-
-        Returns:
-            Integer offset tensor of shape ``(B,)``.
-        """
-        range_size = (high - low).float()
-        return (
-            torch.rand(low.size(0), device=self.device, generator=self.generator) * range_size
-        ).long()
+        """Per-element uniform integer in ``[0, high - low)``."""
+        span = (high - low).float()
+        return (torch.rand(low.size(0), device=self.device, generator=self.generator) * span).long()
