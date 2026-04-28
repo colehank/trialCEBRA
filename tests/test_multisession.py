@@ -1,7 +1,7 @@
 """Tests for TrialAwareMultisessionSampler — isolated sampler behavior.
 
 Covers per-session prior shapes/bounds, cross-session strict invariant,
-class-set / Mode C / device validations, heterogeneous session lengths,
+class-set / device validations, heterogeneous session lengths,
 and mix round-trip.
 """
 
@@ -152,38 +152,39 @@ class TestSamplerInit:
         with pytest.raises(ValueError, match="inconsistent"):
             TrialAwareMultisessionSampler([d_with, d_without], conditional="delta", seed=0)
 
-    def test_mode_c_in_multisession_raises(self):
-        # Mode C: per-timepoint y_discrete + 2-D y_continuous.
-        # Build TrialAwareDistribution with 2-D y to trigger Mode C.
-        import warnings
+    def test_mode_c_in_multisession_accepted(self):
+        # 2-D y + per-timepoint y_discrete: auto-broadcasts to Mode B, accepted in multisession.
+        from trial_cebra.distribution import _DISC_MODE_PER_TP_3D
 
         y2d_0 = torch.randn(8, 10)
         y2d_1 = torch.randn(8, 10)
         _, yd = _make_session_3d(ntrial=8, ntime=20, nd=10, seed=0)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            d0 = TrialAwareDistribution(
-                ntrial=8,
-                ntime=20,
-                conditional="delta",
-                y=y2d_0,
-                y_discrete=yd,
-                sample_exclude_intrial=False,
-                delta=0.5,
-                seed=0,
-            )
-            d1 = TrialAwareDistribution(
-                ntrial=8,
-                ntime=20,
-                conditional="delta",
-                y=y2d_1,
-                y_discrete=yd,
-                sample_exclude_intrial=False,
-                delta=0.5,
-                seed=1,
-            )
-        with pytest.raises(ValueError, match="Mode C"):
-            TrialAwareMultisessionSampler([d0, d1], conditional="delta", seed=0)
+        d0 = TrialAwareDistribution(
+            ntrial=8,
+            ntime=20,
+            conditional="delta",
+            y=y2d_0,
+            y_discrete=yd,
+            sample_exclude_intrial=False,
+            delta=0.5,
+            seed=0,
+        )
+        d1 = TrialAwareDistribution(
+            ntrial=8,
+            ntime=20,
+            conditional="delta",
+            y=y2d_1,
+            y_discrete=yd,
+            sample_exclude_intrial=False,
+            delta=0.5,
+            seed=1,
+        )
+        # Both distributions should be Mode B (auto-broadcast from 2-D y)
+        assert d0._disc_mode == _DISC_MODE_PER_TP_3D
+        assert d1._disc_mode == _DISC_MODE_PER_TP_3D
+        # Sampler should accept them without raising
+        sampler = TrialAwareMultisessionSampler([d0, d1], conditional="delta", seed=0)
+        assert sampler is not None
 
 
 # ---------------------------------------------------------------------------
