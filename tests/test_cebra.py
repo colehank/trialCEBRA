@@ -246,3 +246,118 @@ class TestFitEpochs:
 
 def test_trial_conditionals_set():
     assert TRIAL_CONDITIONALS == {"time", "delta", "time_delta"}
+
+
+# ---------------------------------------------------------------------------
+# transform() shape contract
+# ---------------------------------------------------------------------------
+
+
+class TestTransformShape:
+    def test_2d_in_2d_out(self):
+        X, y2d, _ = _make_epoch_data()
+        model = _model("delta")
+        model.fit(X, y2d)
+        X_flat = X.reshape(NTRIAL * NTIME, -1)
+        emb = model.transform(X_flat)
+        assert emb.ndim == 2
+        assert emb.shape == (NTRIAL * NTIME, 3)
+
+    def test_3d_in_3d_out(self):
+        X, y2d, _ = _make_epoch_data()
+        model = _model("delta")
+        model.fit(X, y2d)
+        emb = model.transform(X)
+        assert emb.ndim == 3
+        assert emb.shape == (NTRIAL, NTIME, 3)
+
+    def test_3d_matches_flat(self):
+        X, y2d, _ = _make_epoch_data()
+        model = _model("delta")
+        model.fit(X, y2d)
+        emb_3d = model.transform(X)
+        emb_2d = model.transform(X.reshape(NTRIAL * NTIME, -1))
+        np.testing.assert_allclose(emb_3d.reshape(NTRIAL * NTIME, -1), emb_2d, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Metrics wrappers
+# ---------------------------------------------------------------------------
+
+
+class TestMetrics:
+    """Tests that the epoch-aware metrics wrappers call the correct import path
+    and handle 3-D input without raising ModuleNotFoundError or shape errors."""
+
+    def _fitted_model(self):
+        X, y2d, _ = _make_epoch_data()
+        m = _model("delta")
+        m.fit(X, y2d)
+        return m, X, y2d
+
+    def test_infonce_loss_3d(self):
+        model, X, y = self._fitted_model()
+        loss = model.infonce_loss(X, y, num_batches=5)
+        assert isinstance(loss, float)
+
+    def test_infonce_loss_flat(self):
+        model, X, y = self._fitted_model()
+        X_flat = X.reshape(NTRIAL * NTIME, -1)
+        y_flat = np.repeat(y, NTIME, axis=0)
+        loss = model.infonce_loss(X_flat, y_flat, num_batches=5)
+        assert isinstance(loss, float)
+
+    def test_goodness_of_fit_score_3d(self):
+        model, X, y = self._fitted_model()
+        gof = model.goodness_of_fit_score(X, y, num_batches=5)
+        assert isinstance(gof, float)
+
+    def test_goodness_of_fit_score_flat(self):
+        model, X, y = self._fitted_model()
+        X_flat = X.reshape(NTRIAL * NTIME, -1)
+        y_flat = np.repeat(y, NTIME, axis=0)
+        gof = model.goodness_of_fit_score(X_flat, y_flat, num_batches=5)
+        assert isinstance(gof, float)
+
+    def test_goodness_of_fit_history(self):
+        model, X, y = self._fitted_model()
+        hist = model.goodness_of_fit_history()
+        assert hasattr(hist, "__len__")
+        assert len(hist) == 5  # max_iterations=5
+
+    def test_state_restored_after_infonce_loss(self):
+        """Instance trial state must be unchanged after an infonce_loss call."""
+        model, X, y = self._fitted_model()
+        ntrial_before = model._ntrial
+        ntime_before = model._ntime
+        model.infonce_loss(X, y, num_batches=5)
+        assert model._ntrial == ntrial_before
+        assert model._ntime == ntime_before
+
+    def test_consistency_score_3d_runs(self):
+        model, X, y = self._fitted_model()
+        emb1 = model.transform(X)  # (NTRIAL, NTIME, 3)
+        emb2 = model.transform(X)
+        scores, pairs, ids = TrialCEBRA.consistency_score([emb1, emb2], between="runs")
+        assert scores.ndim <= 1
+
+    def test_consistency_score_3d_datasets(self):
+        model, X, y = self._fitted_model()
+        emb1 = model.transform(X)  # (NTRIAL, NTIME, 3)
+        emb2 = model.transform(X)
+        # labels: per-trial scalar repeated over time → (NTRIAL, NTIME)
+        y_lbl = np.tile(y[:, 0:1], (1, NTIME))  # (NTRIAL, NTIME)
+        scores, pairs, ids = TrialCEBRA.consistency_score(
+            [emb1, emb2],
+            between="datasets",
+            labels=[y_lbl, y_lbl],
+            dataset_ids=["a", "b"],
+            num_discretization_bins=5,
+        )
+        assert scores.ndim <= 1
+
+    def test_consistency_score_2d_passthrough(self):
+        model, X, y = self._fitted_model()
+        emb_flat = model.transform(X.reshape(NTRIAL * NTIME, -1))
+        scores, pairs, ids = TrialCEBRA.consistency_score([emb_flat, emb_flat], between="runs")
+        assert scores.ndim <= 1

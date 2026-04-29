@@ -471,7 +471,7 @@ class TrialCEBRA(cebra.CEBRA):
         Returns:
             Average InfoNCE loss (float).
         """
-        import cebra.sklearn.metrics as _m
+        import cebra.integrations.sklearn.metrics as _m
 
         X = np.asarray(X)
         saved = None
@@ -510,7 +510,7 @@ class TrialCEBRA(cebra.CEBRA):
         Returns:
             Goodness-of-fit score in bits (float).
         """
-        import cebra.sklearn.metrics as _m
+        import cebra.integrations.sklearn.metrics as _m
 
         X = np.asarray(X)
         saved = None
@@ -535,7 +535,7 @@ class TrialCEBRA(cebra.CEBRA):
         Returns:
             Array of goodness-of-fit values (bits) over training iterations.
         """
-        import cebra.sklearn.metrics as _m
+        import cebra.integrations.sklearn.metrics as _m
 
         return _m.goodness_of_fit_history(self)
 
@@ -568,7 +568,7 @@ class TrialCEBRA(cebra.CEBRA):
             ``(scores, pairs, ids)`` as returned by
             :py:func:`cebra.sklearn.metrics.consistency_score`.
         """
-        import cebra.sklearn.metrics as _m
+        import cebra.integrations.sklearn.metrics as _m
 
         flat_embs = []
         for emb in embeddings:
