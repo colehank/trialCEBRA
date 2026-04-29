@@ -61,7 +61,7 @@ Discrete-first class-conditional trial selection (``"delta"`` only):
 """
 
 from collections.abc import Iterable
-from typing import Callable, Optional
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import cebra
 import cebra.data
@@ -131,18 +131,68 @@ class TrialCEBRA(cebra.CEBRA):
         ... )
         >>> model.fit(X, y)
         TrialCEBRA(...)
-        >>> emb = model.transform(X.reshape(ntrial * ntime, nneuro))
+        >>> emb = model.transform(X)  # 3-D input is accepted directly
     """
 
     def __init__(
         self,
-        *args,
+        model_architecture: str = "offset1-model",
+        device: str = "cuda_if_available",
+        criterion: str = "infonce",
+        distance: str = "cosine",
+        conditional: str = None,
+        temperature: float = 1.0,
+        temperature_mode: Literal["constant", "auto"] = "constant",
+        min_temperature: Optional[float] = 0.1,
+        time_offsets: int = 1,
+        delta: float = None,
+        max_iterations: int = 10000,
+        max_adapt_iterations: int = 500,
+        batch_size: int = None,
+        learning_rate: float = 0.0003,
+        optimizer: str = "adam",
+        output_dimension: int = 8,
+        verbose: bool = False,
+        num_hidden_units: int = 32,
+        pad_before_transform: bool = True,
+        hybrid: bool = False,
+        optimizer_kwargs: Tuple[Tuple[str, object], ...] = (
+            ("betas", (0.9, 0.999)),
+            ("eps", 1e-08),
+            ("weight_decay", 0),
+            ("amsgrad", False),
+        ),
+        masking_kwargs: Optional[
+            Tuple[Tuple[str, Union[float, List[float], Tuple[float, ...]]], ...]
+        ] = None,
         sample_fix_trial: bool = False,
         sample_exclude_intrial: bool = True,
         sample_prior: str = "balanced",
-        **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            model_architecture=model_architecture,
+            device=device,
+            criterion=criterion,
+            distance=distance,
+            conditional=conditional,
+            temperature=temperature,
+            temperature_mode=temperature_mode,
+            min_temperature=min_temperature,
+            time_offsets=time_offsets,
+            delta=delta,
+            max_iterations=max_iterations,
+            max_adapt_iterations=max_adapt_iterations,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            optimizer=optimizer,
+            output_dimension=output_dimension,
+            verbose=verbose,
+            num_hidden_units=num_hidden_units,
+            pad_before_transform=pad_before_transform,
+            hybrid=hybrid,
+            optimizer_kwargs=optimizer_kwargs,
+            masking_kwargs=masking_kwargs,
+        )
         self.sample_fix_trial = sample_fix_trial
         self.sample_exclude_intrial = sample_exclude_intrial
         self.sample_prior = sample_prior
@@ -269,6 +319,26 @@ class TrialCEBRA(cebra.CEBRA):
             callback=callback,
             callback_frequency=callback_frequency,
         )
+
+    def transform(self, X, batch_size=None, session_id=None):
+        """Transform neural data into embeddings.
+
+        Extends :py:meth:`cebra.CEBRA.transform` to accept 3-D epoch-format
+        input ``(ntrial, ntime, nneuro)`` in addition to the native 2-D
+        ``(N, nneuro)`` format.  Output dimensionality matches input:
+        3-D in → ``(ntrial, ntime, output_dimension)`` out;
+        2-D in → ``(N, output_dimension)`` out.
+        """
+        if not torch.is_tensor(X):
+            X = np.asarray(X)
+        is_3d = X.ndim == 3
+        if is_3d:
+            ntrial, ntime = X.shape[0], X.shape[1]
+            X = X.reshape(ntrial * ntime, -1)
+        emb = super().transform(X, batch_size=batch_size, session_id=session_id)
+        if is_3d:
+            emb = emb.reshape(ntrial, ntime, -1)
+        return emb
 
     def transform_epochs(self, X: npt.NDArray) -> npt.NDArray:
         """Transform epoch-format neural data.
