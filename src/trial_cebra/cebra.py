@@ -58,6 +58,38 @@ Discrete-first class-conditional trial selection (``"delta"`` only):
   A tiny Gumbel perturbation is added before ``argmin`` to break ties
   stochastically (needed when all class-c trial embeddings are identical,
   e.g., pre-stim gray-screen labels).
+
+Transform shape contract:
+  :py:meth:`transform` preserves the number of input dimensions:
+
+  * 2-D input ``(N, nneuro)``                → 2-D output ``(N, output_dim)``
+  * 3-D input ``(ntrial, ntime, nneuro)``    → 3-D output ``(ntrial, ntime, output_dim)``
+
+  :py:meth:`transform_epochs` is a strict 3-D-only variant that raises if
+  ``X.ndim != 3``.
+
+Metrics wrappers:
+  All CEBRA metric functions that take raw neural data accept epoch-format
+  ``(ntrial, ntime, nneuro)`` input via the following instance / static
+  methods:
+
+  * :py:meth:`infonce_loss` — wraps :py:func:`cebra.sklearn.metrics.infonce_loss`
+  * :py:meth:`goodness_of_fit_score` — wraps
+    :py:func:`cebra.sklearn.metrics.goodness_of_fit_score`
+  * :py:meth:`goodness_of_fit_history` — passthrough (no X/y, reads training log)
+  * :py:meth:`consistency_score` — static method; flattens 3-D embeddings and
+    2-D labels before calling :py:func:`cebra.sklearn.metrics.consistency_score`
+
+Decoder workflow:
+  CEBRA decoders (:py:class:`cebra.KNNDecoder`,
+  :py:class:`cebra.L1LinearRegressor`) are standalone sklearn estimators that
+  expect 2-D embeddings.  When using epoch data, flatten the output of
+  :py:meth:`transform` before fitting a decoder::
+
+      emb      = model.transform(X)                   # (ntrial, ntime, dim)
+      emb_flat = emb.reshape(-1, emb.shape[-1])        # (ntrial*ntime, dim)
+      y_flat   = y.reshape(-1)                         # (ntrial*ntime,)
+      decoder  = cebra.KNNDecoder().fit(emb_flat, y_flat)
 """
 
 from collections.abc import Iterable
@@ -76,12 +108,11 @@ from trial_cebra.distribution import TRIAL_CONDITIONALS, TrialAwareDistribution
 class TrialCEBRA(cebra.CEBRA):
     """Trial-aware CEBRA estimator.
 
-    Extends :py:class:`cebra.CEBRA` with three trial-aware conditionals.
-    All constructor parameters are inherited from :py:class:`cebra.CEBRA`;
-    the ``conditional`` parameter accepts the three new values listed below
-    in addition to all native CEBRA values.
+    Extends :py:class:`cebra.CEBRA` with three trial-aware conditionals and
+    epoch-format (3-D) data support throughout the fit / transform / metrics
+    pipeline.
 
-    Trial-aware conditionals:
+    **Trial-aware conditionals** (pass via ``conditional=``):
 
     * ``"time"`` — pick a target trial uniformly at random (≠ own),
       draw a positive within ±``time_offsets`` of the reference's relative
@@ -95,6 +126,27 @@ class TrialCEBRA(cebra.CEBRA):
       velocity similarity on trial-onset embeddings (``y`` shape
       ``(ntrial, ntime, nd)``); draw a positive within ±``time_offsets``
       of the reference's relative position.
+
+    **Shape contract for** :py:meth:`transform`:
+
+    Input dimensionality is preserved in the output:
+
+    * ``(N, nneuro)``             → ``(N, output_dim)``
+    * ``(ntrial, ntime, nneuro)`` → ``(ntrial, ntime, output_dim)``
+
+    **Metrics** (all accept epoch-format X directly):
+
+    * :py:meth:`infonce_loss`
+    * :py:meth:`goodness_of_fit_score`
+    * :py:meth:`goodness_of_fit_history`
+    * :py:meth:`consistency_score` (static, accepts 3-D embedding lists)
+
+    **Decoder workflow** (external sklearn decoders expect 2-D embeddings)::
+
+        emb      = model.transform(X)                   # (ntrial, ntime, dim)
+        emb_flat = emb.reshape(-1, emb.shape[-1])        # (ntrial*ntime, dim)
+        y_flat   = y.reshape(-1)
+        decoder  = cebra.KNNDecoder().fit(emb_flat, y_flat)
 
     Args:
         sample_fix_trial: If ``True``, pre-compute the trial→trial mapping once
@@ -111,6 +163,9 @@ class TrialCEBRA(cebra.CEBRA):
             anchor class distribution matches the empirical frequencies.  Has
             no effect when no discrete label is provided.
 
+    All other constructor parameters are inherited from :py:class:`cebra.CEBRA`
+    and forwarded unchanged.
+
     Example::
 
         >>> import numpy as np
@@ -123,15 +178,14 @@ class TrialCEBRA(cebra.CEBRA):
         ...     conditional="delta",
         ...     time_offsets=5,
         ...     delta=0.1,
-        ...     sample_fix_trial=False,
-        ...     sample_exclude_intrial=True,
         ...     max_iterations=10,
         ...     batch_size=32,
         ...     output_dimension=3,
         ... )
         >>> model.fit(X, y)
         TrialCEBRA(...)
-        >>> emb = model.transform(X)  # 3-D input is accepted directly
+        >>> emb = model.transform(X)        # (ntrial, ntime, 3)
+        >>> gof = model.goodness_of_fit_score(X, y)
     """
 
     def __init__(
@@ -355,6 +409,190 @@ class TrialCEBRA(cebra.CEBRA):
         ntrial, ntime, _ = X.shape
         emb = self.transform(X.reshape(ntrial * ntime, -1))
         return emb.reshape(ntrial, ntime, -1)
+
+    # ------------------------------------------------------------------
+    # Metrics — epoch-aware wrappers
+    # ------------------------------------------------------------------
+
+    def _set_epoch_state(self, X: np.ndarray, y: tuple) -> dict:
+        """Temporarily overwrite instance trial metadata with values from new epoch data.
+
+        Returns a *saved* dict that must be passed to :py:meth:`_restore_epoch_state`
+        after the call that needed the updated state.
+
+        Only call this when ``X.ndim == 3``; callers are responsible for the check.
+        """
+        from trial_cebra.epochs import flatten_epochs
+
+        ntrial, ntime = X.shape[0], X.shape[1]
+        X_flat, y_flat, trial_starts, trial_ends = flatten_epochs(X, *y)
+
+        saved = {
+            "_ntrial": getattr(self, "_ntrial", None),
+            "_ntime": getattr(self, "_ntime", None),
+            "_trial_starts": getattr(self, "_trial_starts", None),
+            "_trial_ends": getattr(self, "_trial_ends", None),
+            "_y_epoch": getattr(self, "_y_epoch", ()),
+        }
+        self._ntrial = ntrial
+        self._ntime = ntime
+        self._trial_starts = trial_starts
+        self._trial_ends = trial_ends
+        self._y_epoch = tuple(np.asarray(yi) for yi in y)
+        return X_flat, y_flat, saved
+
+    def _restore_epoch_state(self, saved: Optional[dict]) -> None:
+        if saved is None:
+            return
+        for key, val in saved.items():
+            setattr(self, key, val)
+
+    def infonce_loss(
+        self,
+        X,
+        *y,
+        session_id: Optional[int] = None,
+        num_batches: int = 500,
+        correct_by_batchsize: bool = False,
+    ) -> float:
+        """Compute InfoNCE loss on epoch or flat data.
+
+        Wraps :py:func:`cebra.sklearn.metrics.infonce_loss` with support for
+        3-D epoch-format input ``(ntrial, ntime, nneuro)``.  Labels ``y``
+        follow the same broadcasting rules as :py:meth:`fit`.
+
+        Args:
+            X: Neural data, shape ``(ntrial, ntime, nneuro)`` or ``(N, nneuro)``.
+            y: Label arrays matching ``X``.
+            session_id: Session ID for multisession models.
+            num_batches: Number of batches to average over.
+            correct_by_batchsize: Subtract ``log(batch_size)`` from the loss.
+
+        Returns:
+            Average InfoNCE loss (float).
+        """
+        import cebra.sklearn.metrics as _m
+
+        X = np.asarray(X)
+        saved = None
+        if X.ndim == 3:
+            X, y, saved = self._set_epoch_state(X, y)
+        try:
+            return _m.infonce_loss(
+                self,
+                X,
+                *y,
+                session_id=session_id,
+                num_batches=num_batches,
+                correct_by_batchsize=correct_by_batchsize,
+            )
+        finally:
+            self._restore_epoch_state(saved)
+
+    def goodness_of_fit_score(
+        self,
+        X,
+        *y,
+        session_id: Optional[int] = None,
+        num_batches: int = 500,
+    ) -> float:
+        """Compute goodness-of-fit score on epoch or flat data.
+
+        Wraps :py:func:`cebra.sklearn.metrics.goodness_of_fit_score` with
+        support for 3-D epoch-format input ``(ntrial, ntime, nneuro)``.
+
+        Args:
+            X: Neural data, shape ``(ntrial, ntime, nneuro)`` or ``(N, nneuro)``.
+            y: Label arrays matching ``X``.
+            session_id: Session ID for multisession models.
+            num_batches: Number of batches to average over.
+
+        Returns:
+            Goodness-of-fit score in bits (float).
+        """
+        import cebra.sklearn.metrics as _m
+
+        X = np.asarray(X)
+        saved = None
+        if X.ndim == 3:
+            X, y, saved = self._set_epoch_state(X, y)
+        try:
+            return _m.goodness_of_fit_score(
+                self,
+                X,
+                *y,
+                session_id=session_id,
+                num_batches=num_batches,
+            )
+        finally:
+            self._restore_epoch_state(saved)
+
+    def goodness_of_fit_history(self) -> np.ndarray:
+        """Return the goodness-of-fit history from training.
+
+        Passthrough to :py:func:`cebra.sklearn.metrics.goodness_of_fit_history`.
+
+        Returns:
+            Array of goodness-of-fit values (bits) over training iterations.
+        """
+        import cebra.sklearn.metrics as _m
+
+        return _m.goodness_of_fit_history(self)
+
+    @staticmethod
+    def consistency_score(
+        embeddings,
+        between=None,
+        labels=None,
+        dataset_ids=None,
+        num_discretization_bins: int = 100,
+    ):
+        """Compute consistency score, with support for 3-D epoch embeddings.
+
+        Wraps :py:func:`cebra.sklearn.metrics.consistency_score`.  Any 3-D
+        embedding ``(ntrial, ntime, output_dim)`` is automatically reshaped to
+        ``(ntrial*ntime, output_dim)`` before comparison.  Any 2-D label array
+        ``(ntrial, ntime)`` is flattened to ``(ntrial*ntime,)``; 1-D labels
+        are passed through unchanged.
+
+        Args:
+            embeddings: List of embedding arrays, each ``(N, dim)`` or
+                ``(ntrial, ntime, dim)``.
+            between: ``"runs"`` or ``"datasets"`` — type of comparison.
+            labels: List of label arrays for ``between="datasets"`` alignment.
+                Each may be ``(N,)`` or ``(ntrial, ntime)``.
+            dataset_ids: List of dataset IDs (one per embedding).
+            num_discretization_bins: Bins for label digitization.
+
+        Returns:
+            ``(scores, pairs, ids)`` as returned by
+            :py:func:`cebra.sklearn.metrics.consistency_score`.
+        """
+        import cebra.sklearn.metrics as _m
+
+        flat_embs = []
+        for emb in embeddings:
+            emb = np.asarray(emb) if not isinstance(emb, np.ndarray) else emb
+            if emb.ndim == 3:
+                emb = emb.reshape(-1, emb.shape[-1])
+            flat_embs.append(emb)
+
+        flat_labels = None
+        if labels is not None:
+            flat_labels = []
+            for lbl in labels:
+                lbl = np.asarray(lbl) if not isinstance(lbl, np.ndarray) else lbl
+                if lbl.ndim == 2:
+                    lbl = lbl.reshape(-1)
+                flat_labels.append(lbl)
+
+        return _m.consistency_score(
+            flat_embs,
+            between=between,
+            labels=flat_labels,
+            dataset_ids=dataset_ids,
+            num_discretization_bins=num_discretization_bins,
+        )
 
     # ------------------------------------------------------------------
     # Multi-session fit

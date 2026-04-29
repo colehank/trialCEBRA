@@ -5,17 +5,25 @@ modifying CEBRA's source code.
 
 Usage::
 
+    import numpy as np
     from trial_cebra import TrialCEBRA
 
+    X = np.random.randn(40, 50, 64).astype("float32")  # (ntrial, ntime, nneuro)
+    y = np.random.randn(40, 8).astype("float32")        # (ntrial, nd)
+
     model = TrialCEBRA(
-        conditional="trial_delta",
+        conditional="delta",
         time_offsets=10,
         delta=0.1,
         max_iterations=1000,
+        batch_size=512,
         output_dimension=3,
     )
-    model.fit(X, y, trial_starts=trial_starts, trial_ends=trial_ends)
-    embeddings = model.transform(X)
+    model.fit(X, y)
+
+    emb  = model.transform(X)          # (ntrial, ntime, 3) — shape preserved
+    gof  = model.goodness_of_fit_score(X, y)
+    hist = model.goodness_of_fit_history()
 """
 
 from importlib.metadata import PackageNotFoundError, version
